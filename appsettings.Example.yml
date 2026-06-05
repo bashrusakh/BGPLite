@@ -1,0 +1,10 @@
+Bgp:
+  Asn: 65444
+  RouterId: 1.2.3.4
+  KeepAlive: 60
+  HoldTime: 180
+
+Peers:
+  - Address: 10.0.0.1
+    RemoteAsn: 65001
+    Description: "example-peer"

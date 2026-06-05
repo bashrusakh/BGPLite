@@ -1,0 +1,84 @@
+using BGPLite.Protocol;
+
+namespace BGPLite.Tests;
+
+public class PrefixCodecTests
+{
+    [Fact]
+    public void Encode_24bitPrefix_3bytes()
+    {
+        var prefix = new IpPrefix(0xC0A80000, 24); // 192.168.0.0/24
+        var buffer = new byte[8];
+        var written = PrefixCodec.Encode(prefix, buffer);
+
+        Assert.Equal(4, written);
+        Assert.Equal((byte)24, buffer[0]);
+        Assert.Equal(0xC0, buffer[1]);
+        Assert.Equal(0xA8, buffer[2]);
+        Assert.Equal(0x00, buffer[3]);
+    }
+
+    [Fact]
+    public void Encode_8bitPrefix_2bytes()
+    {
+        var prefix = new IpPrefix(0x0A000000, 8); // 10.0.0.0/8
+        var buffer = new byte[8];
+        var written = PrefixCodec.Encode(prefix, buffer);
+
+        Assert.Equal(2, written);
+        Assert.Equal((byte)8, buffer[0]);
+        Assert.Equal(0x0A, buffer[1]);
+    }
+
+    [Fact]
+    public void Encode_32bitPrefix_5bytes()
+    {
+        var prefix = new IpPrefix(0x01020304, 32); // 1.2.3.4/32
+        var buffer = new byte[8];
+        var written = PrefixCodec.Encode(prefix, buffer);
+
+        Assert.Equal(5, written);
+        Assert.Equal((byte)32, buffer[0]);
+        Assert.Equal(0x01, buffer[1]);
+        Assert.Equal(0x02, buffer[2]);
+        Assert.Equal(0x03, buffer[3]);
+        Assert.Equal(0x04, buffer[4]);
+    }
+
+    [Fact]
+    public void Encode_DefaultRoute_1byte()
+    {
+        var prefix = new IpPrefix(0, 0); // 0.0.0.0/0
+        var buffer = new byte[8];
+        var written = PrefixCodec.Encode(prefix, buffer);
+
+        Assert.Equal(1, written);
+        Assert.Equal((byte)0, buffer[0]);
+    }
+
+    [Fact]
+    public void Roundtrip_VariousPrefixes()
+    {
+        var prefixes = new[]
+        {
+            new IpPrefix(0xC0A80000, 24),
+            new IpPrefix(0x0A000000, 8),
+            new IpPrefix(0x01020304, 32),
+            new IpPrefix(0, 0),
+            new IpPrefix(0xAC100000, 20)
+        };
+
+        var buffer = new byte[64];
+        var written = PrefixCodec.EncodeList(prefixes, buffer);
+
+        var decoded = new IpPrefix[prefixes.Length];
+        var count = PrefixCodec.DecodeList(buffer, written, decoded);
+
+        Assert.Equal(prefixes.Length, count);
+        for (var i = 0; i < count; i++)
+        {
+            Assert.Equal(prefixes[i].Address, decoded[i].Address);
+            Assert.Equal(prefixes[i].Length, decoded[i].Length);
+        }
+    }
+}

@@ -102,6 +102,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
                 response = HandleGetPeers();
             else if (method == "GET" && path == "/api/routes/count")
                 response = HandleGetRouteCount();
+            else if (method == "GET" && path.StartsWith("/api/as/") && path.EndsWith("/prefixes/count"))
+                response = await HandleGetAsPrefixCountAsync(path);
             else if (method == "GET" && path.StartsWith("/api/peer/") && path.EndsWith("/communities"))
                 response = HandleGetPeerCommunities(ExtractPeerIp(path));
             else if (method == "PUT" && path.StartsWith("/api/peer/") && path.EndsWith("/communities"))
@@ -158,6 +160,20 @@ public sealed class ManagementApi : IHostedService, IDisposable
         {
             active = _metrics.ActiveSessions
         });
+    }
+
+    private async Task<ApiResponse> HandleGetAsPrefixCountAsync(string path)
+    {
+        if (_prefixService is null)
+            return ApiResponse.Error("Prefix service not available", 503);
+
+        // /api/as/{asn}/prefixes/count → segments: ["", "api", "as", "{asn}", "prefixes", "count"]
+        var segments = path.Split('/');
+        if (segments.Length < 4 || !uint.TryParse(segments[3], out var asn))
+            return ApiResponse.Error("Invalid ASN", 400);
+
+        var count = await _prefixService.GetPrefixCountAsync(asn);
+        return ApiResponse.Ok(new { asn, prefixCount = count });
     }
 
     private static string ExtractPeerIp(string path)

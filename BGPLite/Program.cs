@@ -69,18 +69,20 @@ builder.Services.AddSingleton<IRouteFilter>(sp =>
 });
 builder.Services.AddSingleton(new BgpMetrics());
 
-// RIPE Stat prefix provider
+// Prefix provider (local nets.txt + RIPE Stat)
 if (config.RipeStat is { AsnLists.Count: > 0 })
-{
     builder.Services.AddHttpClient<RipeStatProvider>(c => c.Timeout = TimeSpan.FromSeconds(30));
-    builder.Services.AddSingleton<PrefixService>();
-}
+builder.Services.AddSingleton(sp =>
+{
+    RipeStatProvider? ripe = null;
+    try { ripe = sp.GetRequiredService<RipeStatProvider>(); } catch { }
+    return new PrefixService(config, netsPath, ripe);
+});
 
 builder.Services.AddHostedService(sp =>
 {
     var store = sp.GetRequiredService<PeerStore>();
-    PrefixService? prefixService = null;
-    try { prefixService = sp.GetRequiredService<PrefixService>(); } catch { }
+    var prefixService = sp.GetRequiredService<PrefixService>();
 
     return new BgpServer(
         sp.GetRequiredService<AppConfig>(),

@@ -2,9 +2,11 @@ using System.Net;
 using BGPLite.Api;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
+using BGPLite.Providers;
 using BGPLite.Routing;
 using BGPLite.Server;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -53,21 +55,30 @@ if (Directory.Exists(communitiesDir))
 
 // SQLite peer store
 var dbPath = Path.Combine(dataDir, "bgplite.db");
-var peerStore = new PeerStore(dbPath);
 Console.WriteLine($"Peer database: {dbPath}");
-
-// Route filter — reads communities from PeerStore
-var peerFilter = new PeerCommunityFilter(ip => peerStore.GetCommunities(ip));
 
 builder.Services.AddSingleton(config);
 builder.Services.AddSingleton(config.Bgp);
 builder.Services.AddSingleton(routeTable);
-builder.Services.AddSingleton<IRouteFilter>(peerFilter);
-builder.Services.AddSingleton(peerStore);
+builder.Services.AddSingleton(new BgpDbContext(dbPath));
+builder.Services.AddSingleton<PeerStore>();
+builder.Services.AddSingleton<IRouteFilter>(sp =>
+{
+    var store = sp.GetRequiredService<PeerStore>();
+    return new PeerCommunityFilter(ip => store.GetCommunitiesByIp(ip));
+});
 builder.Services.AddSingleton(new BgpMetrics());
+
+// RIPE Stat prefix provider
+if (config.RipeStat is { AsnLists.Count: > 0 })
+    builder.Services.AddHttpClient<RipeStatProvider>(c => c.Timeout = TimeSpan.FromSeconds(30));
+
 builder.Services.AddHostedService(sp =>
 {
     var store = sp.GetRequiredService<PeerStore>();
+    RipeStatProvider? ripe = null;
+    try { ripe = sp.GetRequiredService<RipeStatProvider>(); } catch { }
+
     return new BgpServer(
         sp.GetRequiredService<AppConfig>(),
         sp.GetRequiredService<RouteTable>(),
@@ -75,9 +86,17 @@ builder.Services.AddHostedService(sp =>
         sp.GetRequiredService<BgpMetrics>(),
         sp.GetRequiredService<ILogger<BgpSession>>(),
         sp.GetRequiredService<ILogger<BgpServer>>(),
-        (ip, asn) => store.UpsertPeer(ip, asn));
+        (ip, asn) => store.UpsertPeer(ip, asn),
+        store,
+        ripe);
 });
 builder.Services.AddHostedService<ManagementApi>();
+
+if (config.RipeStat is { AsnLists.Count: > 0 })
+{
+    foreach (var list in config.RipeStat.AsnLists)
+        Console.WriteLine($"  {list.Name}: {list.Description} ({list.Asns.Count} ASNs)");
+}
 
 var host = builder.Build();
 

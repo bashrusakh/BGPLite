@@ -1,167 +1,120 @@
-using Microsoft.Data.Sqlite;
+using BGPLite.Api.Entities;
+using Microsoft.EntityFrameworkCore;
 
 namespace BGPLite.Api;
 
-public sealed class PeerStore : IDisposable
+public sealed class PeerStore
 {
-    private readonly SqliteConnection _connection;
+    private readonly BgpDbContext _db;
 
-    public PeerStore(string dbPath)
+    public PeerStore(BgpDbContext db) => _db = db;
+
+    public string CreatePeer(string ip, uint asn, string? description)
     {
-        var dir = Path.GetDirectoryName(dbPath);
-        if (!string.IsNullOrEmpty(dir))
-            Directory.CreateDirectory(dir);
-
-        _connection = new SqliteConnection($"Data Source={dbPath}");
-        _connection.Open();
-        InitSchema();
-    }
-
-    private void InitSchema()
-    {
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS peers (
-                ip TEXT PRIMARY KEY,
-                asn INTEGER,
-                description TEXT,
-                connected_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS peer_communities (
-                peer_ip TEXT NOT NULL,
-                community INTEGER NOT NULL,
-                PRIMARY KEY (peer_ip, community),
-                FOREIGN KEY (peer_ip) REFERENCES peers(ip) ON DELETE CASCADE
-            )
-            """;
-        cmd.ExecuteNonQuery();
+        var peer = new Peer { Ip = ip, Asn = asn, Description = description };
+        _db.Peers.Add(peer);
+        _db.SaveChanges();
+        return peer.Id;
     }
 
     public void UpsertPeer(string ip, uint asn)
     {
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO peers (ip, asn, connected_at)
-            VALUES ($ip, $asn, $now)
-            ON CONFLICT(ip) DO UPDATE SET asn=$asn, connected_at=$now
-            """;
-        cmd.Parameters.AddWithValue("$ip", ip);
-        cmd.Parameters.AddWithValue("$asn", (long)asn);
-        cmd.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O"));
-        cmd.ExecuteNonQuery();
-    }
-
-    public List<PeerInfo> GetAllPeers()
-    {
-        var peers = new List<PeerInfo>();
-
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "SELECT ip, asn, description, connected_at FROM peers";
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
+        var peer = _db.Peers.FirstOrDefault(p => p.Ip == ip);
+        if (peer is null)
         {
-            peers.Add(new PeerInfo
-            {
-                Ip = reader.GetString(0),
-                Asn = reader.IsDBNull(1) ? null : (uint?)reader.GetInt64(1),
-                Description = reader.IsDBNull(2) ? null : reader.GetString(2),
-                ConnectedAt = reader.IsDBNull(3) ? null : reader.GetString(3)
-            });
+            _db.Peers.Add(new Peer { Ip = ip, Asn = asn, Status = "active" });
         }
-
-        foreach (var peer in peers)
-            peer.Communities = GetCommunities(peer.Ip);
-
-        return peers;
-    }
-
-    public PeerInfo? GetPeer(string ip)
-    {
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "SELECT ip, asn, description, connected_at FROM peers WHERE ip=$ip";
-        cmd.Parameters.AddWithValue("$ip", ip);
-        using var reader = cmd.ExecuteReader();
-        if (!reader.Read()) return null;
-
-        var peer = new PeerInfo
+        else
         {
-            Ip = reader.GetString(0),
-            Asn = reader.IsDBNull(1) ? null : (uint?)reader.GetInt64(1),
-            Description = reader.IsDBNull(2) ? null : reader.GetString(2),
-            ConnectedAt = reader.IsDBNull(3) ? null : reader.GetString(3),
-            Communities = GetCommunities(ip)
-        };
-        return peer;
-    }
-
-    public HashSet<uint> GetCommunities(string ip)
-    {
-        var communities = new HashSet<uint>();
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "SELECT community FROM peer_communities WHERE peer_ip=$ip";
-        cmd.Parameters.AddWithValue("$ip", ip);
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
-            communities.Add((uint)reader.GetInt64(0));
-        return communities;
-    }
-
-    public void SetCommunities(string ip, HashSet<uint> communities)
-    {
-        using var tx = _connection.BeginTransaction();
-        try
-        {
-            using (var del = _connection.CreateCommand())
-            {
-                del.CommandText = "DELETE FROM peer_communities WHERE peer_ip=$ip";
-                del.Parameters.AddWithValue("$ip", ip);
-                del.ExecuteNonQuery();
-            }
-
-            foreach (var c in communities)
-            {
-                using var ins = _connection.CreateCommand();
-                ins.CommandText = "INSERT INTO peer_communities (peer_ip, community) VALUES ($ip, $c)";
-                ins.Parameters.AddWithValue("$ip", ip);
-                ins.Parameters.AddWithValue("$c", (long)c);
-                ins.ExecuteNonQuery();
-            }
-
-            tx.Commit();
+            peer.Asn = asn;
+            peer.Status = "active";
+            peer.LastSessionAt = DateTime.UtcNow;
         }
-        catch
-        {
-            tx.Rollback();
-            throw;
-        }
+        _db.SaveChanges();
     }
 
-    public void ClearCommunities(string ip)
+    public void UpdateSessionStatus(string ip, bool active)
     {
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "DELETE FROM peer_communities WHERE peer_ip=$ip";
-        cmd.Parameters.AddWithValue("$ip", ip);
-        cmd.ExecuteNonQuery();
+        var peer = _db.Peers.FirstOrDefault(p => p.Ip == ip);
+        if (peer is null) return;
+
+        peer.Status = active ? "active" : "inactive";
+        if (active) peer.LastSessionAt = DateTime.UtcNow;
+        _db.SaveChanges();
     }
 
-    public void SetDescription(string ip, string description)
+    public void DeletePeer(string id)
     {
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "UPDATE peers SET description=$desc WHERE ip=$ip";
-        cmd.Parameters.AddWithValue("$desc", description);
-        cmd.Parameters.AddWithValue("$ip", ip);
-        cmd.ExecuteNonQuery();
+        _db.Peers.Where(p => p.Id == id).ExecuteDelete();
     }
 
-    public void Dispose() => _connection.Dispose();
-}
+    public List<Peer> GetAllPeers() =>
+        _db.Peers.Include(p => p.Communities).ToList();
 
-public class PeerInfo
-{
-    public string Ip { get; init; } = "";
-    public uint? Asn { get; init; }
-    public string? Description { get; init; }
-    public string? ConnectedAt { get; init; }
-    public HashSet<uint> Communities { get; set; } = [];
+    public Peer? GetPeerById(string id) =>
+        _db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Id == id);
+
+    public Peer? GetPeerByIp(string ip) =>
+        _db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Ip == ip);
+
+    public void SetDescription(string id, string description)
+    {
+        _db.Peers.Where(p => p.Id == id).ExecuteUpdate(
+            s => s.SetProperty(p => p.Description, description));
+    }
+
+    public HashSet<uint> GetCommunities(string peerId) =>
+        _db.Peers.Include(p => p.Communities)
+            .Where(p => p.Id == peerId)
+            .SelectMany(p => p.Communities)
+            .Select(c => (uint)c.Community)
+            .ToHashSet();
+
+    public HashSet<uint> GetCommunitiesByIp(string ip) =>
+        _db.Peers.Include(p => p.Communities)
+            .Where(p => p.Ip == ip)
+            .SelectMany(p => p.Communities)
+            .Select(c => (uint)c.Community)
+            .ToHashSet();
+
+    public void SetCommunities(string peerId, HashSet<uint> communities)
+    {
+        _db.Set<PeerCommunity>().Where(c => c.PeerId == peerId).ExecuteDelete();
+        _db.Set<PeerCommunity>().AddRange(
+            communities.Select(c => new PeerCommunity { PeerId = peerId, Community = c }));
+        _db.SaveChanges();
+    }
+
+    public void ClearCommunities(string peerId)
+    {
+        _db.Set<PeerCommunity>().Where(c => c.PeerId == peerId).ExecuteDelete();
+    }
+
+    public List<string> GetSubscriptions(string peerId) =>
+        _db.Set<PeerSubscription>()
+            .Where(s => s.PeerId == peerId)
+            .Select(s => s.AsnListName)
+            .ToList();
+
+    public void SetSubscriptions(string peerId, List<string> asnListNames)
+    {
+        _db.Set<PeerSubscription>().Where(s => s.PeerId == peerId).ExecuteDelete();
+        _db.Set<PeerSubscription>().AddRange(
+            asnListNames.Select(n => new PeerSubscription { PeerId = peerId, AsnListName = n }));
+        _db.SaveChanges();
+    }
+
+    public List<string> GetCustomPrefixes(string peerId) =>
+        _db.Set<PeerCustomPrefix>()
+            .Where(c => c.PeerId == peerId)
+            .Select(c => c.Prefix + "/" + c.PrefixLength)
+            .ToList();
+
+    public void SetCustomPrefixes(string peerId, List<(string Prefix, byte Length)> prefixes)
+    {
+        _db.Set<PeerCustomPrefix>().Where(c => c.PeerId == peerId).ExecuteDelete();
+        _db.Set<PeerCustomPrefix>().AddRange(
+            prefixes.Select(p => new PeerCustomPrefix { PeerId = peerId, Prefix = p.Prefix, PrefixLength = p.Length }));
+        _db.SaveChanges();
+    }
 }

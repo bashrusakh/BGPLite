@@ -7,16 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\BGPLite.Api\BGPLite.Api.csproj" />
-    <ProjectReference Include="..\BGPLite.Configuration\BGPLite.Configuration.csproj" />
     <ProjectReference Include="..\BGPLite.Protocol\BGPLite.Protocol.csproj" />
-    <ProjectReference Include="..\BGPLite.Providers\BGPLite.Providers.csproj" />
     <ProjectReference Include="..\BGPLite.Routing\BGPLite.Routing.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
   </ItemGroup>
 
 </Project>

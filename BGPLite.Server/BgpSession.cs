@@ -1,8 +1,10 @@
 using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
+using BGPLite.Api;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
+using BGPLite.Providers;
 using BGPLite.Routing;
 using Microsoft.Extensions.Logging;
 
@@ -20,6 +22,9 @@ public sealed class BgpSession : IDisposable
     private readonly ILogger<BgpSession> _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly Action<string, uint>? _onPeerIdentified;
+    private readonly PeerStore? _peerStore;
+    private readonly RipeStatProvider? _ripeStatProvider;
+    private readonly AppConfig? _appConfig;
 
     private BgpFsmState _state = BgpFsmState.Idle;
     private uint _remoteAsn;
@@ -40,7 +45,10 @@ public sealed class BgpSession : IDisposable
         IRouteFilter routeFilter,
         BgpMetrics metrics,
         ILogger<BgpSession> logger,
-        Action<string, uint>? onPeerIdentified = null)
+        Action<string, uint>? onPeerIdentified = null,
+        PeerStore? peerStore = null,
+        RipeStatProvider? ripeStatProvider = null,
+        AppConfig? appConfig = null)
     {
         _socket = socket;
         _stream = new NetworkStream(socket, ownsSocket: true);
@@ -51,6 +59,9 @@ public sealed class BgpSession : IDisposable
         _metrics = metrics;
         _logger = logger;
         _onPeerIdentified = onPeerIdentified;
+        _peerStore = peerStore;
+        _ripeStatProvider = ripeStatProvider;
+        _appConfig = appConfig;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
@@ -256,33 +267,103 @@ public sealed class BgpSession : IDisposable
 
     private async Task SendAllRoutesAsync()
     {
-        var routes = _routeTable.GetAll();
-        if (routes.Count == 0) return;
-
         var nextHop = BgpConstants.IPAddressToUint(_bgpConfig.GetRouterIdAddress());
+        var routes = new List<Route>();
 
-        const int maxNlriPerUpdate = 100;
-        var sent = 0;
-        var batchRoutes = new List<Route>(maxNlriPerUpdate);
-
-        foreach (var route in routes)
+        // Try dynamic route fetching from peer subscriptions
+        if (_peerStore is not null && _ripeStatProvider is not null && _appConfig is not null)
         {
-            if (!_routeFilter.AcceptOutgoing(route, _peerConfig)) continue;
-
-            batchRoutes.Add(route);
-
-            if (batchRoutes.Count >= maxNlriPerUpdate)
+            var peer = _peerStore.GetPeerByIp(_peerConfig.Address);
+            if (peer is not null)
             {
-                await SendRouteBatchAsync(nextHop, batchRoutes);
-                sent += batchRoutes.Count;
-                batchRoutes.Clear();
+                _peerStore.UpdateSessionStatus(_peerConfig.Address, true);
+
+                var subscriptionNames = _peerStore.GetSubscriptions(peer.Id);
+                var asnLists = _appConfig.RipeStat?.AsnLists
+                    .Where(l => subscriptionNames.Contains(l.Name))
+                    .ToList() ?? [];
+
+                // Fetch prefixes for each subscribed AS list
+                foreach (var asnList in asnLists)
+                {
+                    foreach (var asn in asnList.Asns)
+                    {
+                        try
+                        {
+                            var prefixes = await _ripeStatProvider.GetPrefixesAsync(asn);
+                            foreach (var (prefix, length) in prefixes)
+                            {
+                                routes.Add(new Route
+                                {
+                                    Prefix = prefix,
+                                    PrefixLength = length,
+                                    NextHop = nextHop,
+                                    AsPath = [asn]
+                                });
+                            }
+                            _logger.LogInformation("Fetched {Count} prefixes for AS{Asn} ({List}) for {Peer}",
+                                prefixes.Count, asn, asnList.Name, _peerConfig.Address);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Failed to fetch prefixes for AS{Asn} for {Peer}", asn, _peerConfig.Address);
+                        }
+                    }
+                }
+
+                // Add custom prefixes
+                var customPrefixes = _peerStore.GetCustomPrefixes(peer.Id);
+                foreach (var cidr in customPrefixes)
+                {
+                    var slash = cidr.IndexOf('/');
+                    var ip = IPAddress.Parse(cidr[..slash]);
+                    var length = byte.Parse(cidr[(slash + 1)..]);
+                    var prefix = BgpConstants.IPAddressToUint(ip);
+                    routes.Add(new Route
+                    {
+                        Prefix = prefix,
+                        PrefixLength = length,
+                        NextHop = nextHop
+                    });
+                }
+
+                if (routes.Count > 0)
+                {
+                    await SendRoutesAsync(nextHop, routes);
+                    return;
+                }
             }
         }
 
-        if (batchRoutes.Count > 0)
+        // Fallback: send from shared route table
+        var tableRoutes = _routeTable.GetAll();
+        if (tableRoutes.Count == 0) return;
+
+        var filtered = tableRoutes.Where(r => _routeFilter.AcceptOutgoing(r, _peerConfig)).ToList();
+        await SendRoutesAsync(nextHop, filtered);
+    }
+
+    private async Task SendRoutesAsync(uint nextHop, List<Route> routes)
+    {
+        const int maxNlriPerUpdate = 100;
+        var sent = 0;
+        var batch = new List<Route>(maxNlriPerUpdate);
+
+        foreach (var route in routes)
         {
-            await SendRouteBatchAsync(nextHop, batchRoutes);
-            sent += batchRoutes.Count;
+            batch.Add(route);
+            if (batch.Count >= maxNlriPerUpdate)
+            {
+                await SendRouteBatchAsync(nextHop, batch);
+                sent += batch.Count;
+                batch.Clear();
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            await SendRouteBatchAsync(nextHop, batch);
+            sent += batch.Count;
         }
 
         _logger.LogInformation("UpdateSent {Count} routes to {Peer}", sent, _peerConfig.Address);

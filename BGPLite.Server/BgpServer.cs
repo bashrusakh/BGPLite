@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using BGPLite.Api;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
+using BGPLite.Providers;
 using BGPLite.Routing;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -18,6 +20,8 @@ public sealed class BgpServer : IHostedService, IDisposable
     private readonly ILogger<BgpSession> _sessionLogger;
     private readonly ILogger<BgpServer> _logger;
     private readonly Action<string, uint>? _onPeerIdentified;
+    private readonly PeerStore? _peerStore;
+    private readonly RipeStatProvider? _ripeStatProvider;
     private readonly ConcurrentDictionary<string, BgpSession> _sessions = new();
     private readonly CancellationTokenSource _cts = new();
     private Socket? _listener;
@@ -35,7 +39,9 @@ public sealed class BgpServer : IHostedService, IDisposable
         BgpMetrics metrics,
         ILogger<BgpSession> sessionLogger,
         ILogger<BgpServer> logger,
-        Action<string, uint>? onPeerIdentified = null)
+        Action<string, uint>? onPeerIdentified = null,
+        PeerStore? peerStore = null,
+        RipeStatProvider? ripeStatProvider = null)
     {
         _config = config;
         _routeTable = routeTable;
@@ -44,6 +50,8 @@ public sealed class BgpServer : IHostedService, IDisposable
         _sessionLogger = sessionLogger;
         _logger = logger;
         _onPeerIdentified = onPeerIdentified;
+        _peerStore = peerStore;
+        _ripeStatProvider = ripeStatProvider;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -110,7 +118,8 @@ public sealed class BgpServer : IHostedService, IDisposable
                 var session = new BgpSession(
                     socket, peerConfig, _config.Bgp, _routeTable,
                     _routeFilter, _metrics, _sessionLogger,
-                    _onPeerIdentified);
+                    _onPeerIdentified,
+                    _peerStore, _ripeStatProvider, _config);
 
                 _sessions[peerAddress] = session;
 

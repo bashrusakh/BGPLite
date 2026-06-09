@@ -1,6 +1,8 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using BGPLite.Api.Entities;
+using BGPLite.Configuration;
 using BGPLite.Routing;
 using BGPLite.Server;
 using Microsoft.Extensions.Hosting;
@@ -12,6 +14,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
 {
     private readonly PeerStore _store;
     private readonly RouteTable _routeTable;
+    private readonly AppConfig _config;
+    private readonly BgpMetrics _metrics;
     private readonly ILogger<ManagementApi> _logger;
     private HttpListener? _listener;
     private Task? _listenTask;
@@ -20,10 +24,14 @@ public sealed class ManagementApi : IHostedService, IDisposable
     public ManagementApi(
         PeerStore store,
         RouteTable routeTable,
+        AppConfig config,
+        BgpMetrics metrics,
         ILogger<ManagementApi> logger)
     {
         _store = store;
         _routeTable = routeTable;
+        _config = config;
+        _metrics = metrics;
         _logger = logger;
     }
 
@@ -75,7 +83,18 @@ public sealed class ManagementApi : IHostedService, IDisposable
         {
             ApiResponse response;
 
-            if (method == "GET" && path == "/api/peers")
+            if (method == "GET" && path == "/api/my-ip")
+            {
+                var clientIp = ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
+                response = ApiResponse.Ok(new { ip = clientIp });
+            }
+            else if (method == "GET" && path == "/api/asn-lists")
+                response = HandleGetAsnLists();
+            else if (method == "GET" && path == "/api/sessions")
+                response = HandleGetSessions();
+            else if (method == "POST" && path == "/api/peers")
+                response = await HandleCreatePeer(ctx);
+            else if (method == "GET" && path == "/api/peers")
                 response = HandleGetPeers();
             else if (method == "GET" && path == "/api/routes/count")
                 response = HandleGetRouteCount();
@@ -98,6 +117,27 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
     }
 
+    private ApiResponse HandleGetAsnLists()
+    {
+        var lists = _config.RipeStat?.AsnLists ?? [];
+        return ApiResponse.Ok(lists.Select(l => new
+        {
+            l.Name,
+            l.Description,
+            l.Country,
+            asns = l.Asns,
+            type = l.Country is not null ? "country" : "asn"
+        }));
+    }
+
+    private ApiResponse HandleGetSessions()
+    {
+        return ApiResponse.Ok(new
+        {
+            active = _metrics.ActiveSessions
+        });
+    }
+
     private static string ExtractPeerIp(string path)
     {
         // /api/peer/{ip}/communities → segments: ["", "api", "peer", "{ip}", ...]
@@ -109,18 +149,21 @@ public sealed class ManagementApi : IHostedService, IDisposable
         var peers = _store.GetAllPeers();
         return ApiResponse.Ok(peers.Select(p => new
         {
+            id = p.Id,
             ip = p.Ip,
             asn = p.Asn,
             description = p.Description,
-            connectedAt = p.ConnectedAt,
-            communities = p.Communities.Select(CommunityToString),
+            status = p.Status,
+            createdAt = p.CreatedAt,
+            lastSessionAt = p.LastSessionAt,
+            communities = p.Communities.Select(c => CommunityToString((uint)c.Community)),
             allRoutes = p.Communities.Count == 0
         }));
     }
 
     private ApiResponse HandleGetPeerCommunities(string peerIp)
     {
-        var communities = _store.GetCommunities(peerIp);
+        var communities = _store.GetCommunitiesByIp(peerIp);
         return ApiResponse.Ok(new
         {
             ip = peerIp,
@@ -131,6 +174,10 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     private async Task<ApiResponse> HandleSetPeerCommunities(string peerIp, HttpListenerContext ctx)
     {
+        var peer = _store.GetPeerByIp(peerIp);
+        if (peer is null)
+            return ApiResponse.Error("Peer not found", 404);
+
         using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
         var body = await reader.ReadToEndAsync();
         var data = JsonSerializer.Deserialize<SetCommunitiesRequest>(body);
@@ -142,7 +189,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
         foreach (var c in data.Communities)
             communities.Add(ParseCommunity(c));
 
-        _store.SetCommunities(peerIp, communities);
+        _store.SetCommunities(peer.Id, communities);
 
         _logger.LogInformation("Updated communities for {Peer}: {Communities}",
             peerIp, string.Join(", ", communities.Select(CommunityToString)));
@@ -152,6 +199,10 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     private async Task<ApiResponse> HandleSetPeerDescription(string peerIp, HttpListenerContext ctx)
     {
+        var peer = _store.GetPeerByIp(peerIp);
+        if (peer is null)
+            return ApiResponse.Error("Peer not found", 404);
+
         using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
         var body = await reader.ReadToEndAsync();
         var data = JsonSerializer.Deserialize<SetDescriptionRequest>(body);
@@ -159,7 +210,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
         if (data?.Description is null)
             return ApiResponse.Error("Invalid request body", 400);
 
-        _store.SetDescription(peerIp, data.Description);
+        _store.SetDescription(peer.Id, data.Description);
 
         _logger.LogInformation("Updated description for {Peer}: {Desc}", peerIp, data.Description);
 
@@ -168,7 +219,11 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     private ApiResponse HandleDeletePeerCommunities(string peerIp)
     {
-        _store.ClearCommunities(peerIp);
+        var peer = _store.GetPeerByIp(peerIp);
+        if (peer is null)
+            return ApiResponse.Error("Peer not found", 404);
+
+        _store.ClearCommunities(peer.Id);
 
         _logger.LogInformation("Removed community filter for {Peer}", peerIp);
         return ApiResponse.Ok(new { ip = peerIp, allRoutes = true });
@@ -185,6 +240,55 @@ public sealed class ManagementApi : IHostedService, IDisposable
             .ToDictionary(g => g.Key == 0 ? "default" : CommunityToString(g.Key), g => g.Count());
 
         return ApiResponse.Ok(new { total = routes.Count, byCommunity });
+    }
+
+    private async Task<ApiResponse> HandleCreatePeer(HttpListenerContext ctx)
+    {
+        using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
+        var body = await reader.ReadToEndAsync();
+        var data = JsonSerializer.Deserialize<CreatePeerRequest>(body);
+
+        if (data is null)
+            return ApiResponse.Error("Invalid request body", 400);
+
+        var asnLists = data.AsnLists ?? [];
+        var customPrefixes = new List<(string Prefix, byte Length)>();
+
+        if (data.CustomPrefixes is not null)
+        {
+            foreach (var cidr in data.CustomPrefixes)
+            {
+                var slash = cidr.IndexOf('/');
+                if (slash < 0)
+                    return ApiResponse.Error($"Invalid CIDR: {cidr}", 400);
+                var prefix = cidr[..slash];
+                var length = byte.Parse(cidr[(slash + 1)..]);
+                customPrefixes.Add((prefix, length));
+            }
+        }
+
+        var id = _store.CreatePeer(data.Ip, data.Asn, data.Description);
+        if (asnLists.Count > 0)
+            _store.SetSubscriptions(id, asnLists);
+        if (customPrefixes.Count > 0)
+            _store.SetCustomPrefixes(id, customPrefixes);
+
+        var peer = _store.GetPeerById(id);
+
+        _logger.LogInformation("Created peer {Ip} AS{Asn} ({Id}): {Subs} lists, {Prefixes} custom prefixes",
+            data.Ip, data.Asn, id, asnLists.Count, customPrefixes.Count);
+
+        return ApiResponse.Ok(new
+        {
+            id,
+            ip = data.Ip,
+            asn = data.Asn,
+            description = data.Description,
+            status = peer?.Status ?? "inactive",
+            createdAt = peer?.CreatedAt,
+            asnLists,
+            customPrefixes = data.CustomPrefixes ?? []
+        });
     }
 
     private static uint ParseCommunity(string community)
@@ -221,6 +325,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     private record SetCommunitiesRequest(List<string> Communities);
     private record SetDescriptionRequest(string Description);
+    private record CreatePeerRequest(string Ip, uint Asn, string? Description, List<string>? AsnLists, List<string>? CustomPrefixes);
 
     private record ApiResponse(object? Body, int StatusCode = 200)
     {

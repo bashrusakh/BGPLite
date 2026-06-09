@@ -2,10 +2,11 @@ using System.Collections.Concurrent;
 using System.Net;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
+using BGPLite.Server;
 
 namespace BGPLite.Providers;
 
-public sealed class PrefixService
+public sealed class PrefixService : IPrefixService
 {
     private readonly RipeStatProvider? _ripeStat;
     private readonly AppConfig _config;

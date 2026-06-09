@@ -1,10 +1,8 @@
 using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
-using BGPLite.Api;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
-using BGPLite.Providers;
 using BGPLite.Routing;
 using Microsoft.Extensions.Logging;
 
@@ -22,8 +20,8 @@ public sealed class BgpSession : IDisposable
     private readonly ILogger<BgpSession> _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly Action<string, uint>? _onPeerIdentified;
-    private readonly PeerStore? _peerStore;
-    private readonly PrefixService? _prefixService;
+    private readonly IPeerStore? _peerStore;
+    private readonly IPrefixService? _prefixService;
     private readonly AppConfig? _appConfig;
 
     private BgpFsmState _state = BgpFsmState.Idle;
@@ -46,8 +44,8 @@ public sealed class BgpSession : IDisposable
         BgpMetrics metrics,
         ILogger<BgpSession> logger,
         Action<string, uint>? onPeerIdentified = null,
-        PeerStore? peerStore = null,
-        PrefixService? prefixService = null,
+        IPeerStore? peerStore = null,
+        IPrefixService? prefixService = null,
         AppConfig? appConfig = null)
     {
         _socket = socket;

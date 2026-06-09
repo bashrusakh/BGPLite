@@ -1,10 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using BGPLite.Api;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
-using BGPLite.Providers;
 using BGPLite.Routing;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -20,8 +18,8 @@ public sealed class BgpServer : IHostedService, IDisposable
     private readonly ILogger<BgpSession> _sessionLogger;
     private readonly ILogger<BgpServer> _logger;
     private readonly Action<string, uint>? _onPeerIdentified;
-    private readonly PeerStore? _peerStore;
-    private readonly PrefixService? _prefixService;
+    private readonly IPeerStore? _peerStore;
+    private readonly IPrefixService? _prefixService;
     private readonly ConcurrentDictionary<string, BgpSession> _sessions = new();
     private readonly CancellationTokenSource _cts = new();
     private Socket? _listener;
@@ -40,8 +38,8 @@ public sealed class BgpServer : IHostedService, IDisposable
         ILogger<BgpSession> sessionLogger,
         ILogger<BgpServer> logger,
         Action<string, uint>? onPeerIdentified = null,
-        PeerStore? peerStore = null,
-        PrefixService? prefixService = null)
+        IPeerStore? peerStore = null,
+        IPrefixService? prefixService = null)
     {
         _config = config;
         _routeTable = routeTable;

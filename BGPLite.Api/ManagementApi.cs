@@ -3,7 +3,6 @@ using System.Text;
 using System.Text.Json;
 using BGPLite.Api.Entities;
 using BGPLite.Configuration;
-using BGPLite.Providers;
 using BGPLite.Routing;
 using BGPLite.Server;
 using Microsoft.Extensions.Hosting;
@@ -17,8 +16,9 @@ public sealed class ManagementApi : IHostedService, IDisposable
     private readonly RouteTable _routeTable;
     private readonly AppConfig _config;
     private readonly BgpMetrics _metrics;
-    private readonly PrefixService? _prefixService;
+    private readonly IPrefixService? _prefixService;
     private readonly ILogger<ManagementApi> _logger;
+    private readonly int _port;
     private HttpListener? _listener;
     private Task? _listenTask;
     private CancellationTokenSource _cts = new();
@@ -29,7 +29,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
         AppConfig config,
         BgpMetrics metrics,
         ILogger<ManagementApi> logger,
-        PrefixService? prefixService = null)
+        IPrefixService? prefixService = null)
     {
         _store = store;
         _routeTable = routeTable;
@@ -37,15 +37,16 @@ public sealed class ManagementApi : IHostedService, IDisposable
         _metrics = metrics;
         _prefixService = prefixService;
         _logger = logger;
+        _port = config.ApiPort;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _listener = new HttpListener();
-        _listener.Prefixes.Add("http://+:5000/");
+        _listener.Prefixes.Add($"http://+:{_port}/");
         _listener.Start();
 
-        _logger.LogInformation("Management API listening on http://+:5000/");
+        _logger.LogInformation("Management API listening on http://+:{Port}/", _port);
         _listenTask = ListenAsync(_cts.Token);
         return Task.CompletedTask;
     }
@@ -80,6 +81,15 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     private async Task HandleAsync(HttpListenerContext ctx)
     {
+        AddCorsHeaders(ctx);
+
+        if (ctx.Request.HttpMethod == "OPTIONS")
+        {
+            ctx.Response.StatusCode = 204;
+            ctx.Response.Close();
+            return;
+        }
+
         var path = ctx.Request.Url!.AbsolutePath;
         var method = ctx.Request.HttpMethod;
 
@@ -119,7 +129,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
         catch (Exception ex)
         {
-            await WriteResponse(ctx, ApiResponse.Error(ex.Message, 500));
+            _logger.LogError(ex, "API error {Method} {Path}: {Message}", method, path, ex.Message);
+            await WriteResponse(ctx, ApiResponse.Error(ex.InnerException?.Message ?? ex.Message, 500));
         }
     }
 
@@ -352,6 +363,13 @@ public sealed class ManagementApi : IHostedService, IDisposable
         var bytes = Encoding.UTF8.GetBytes(json);
         await ctx.Response.OutputStream.WriteAsync(bytes);
         ctx.Response.Close();
+    }
+
+    private static void AddCorsHeaders(HttpListenerContext ctx)
+    {
+        ctx.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+        ctx.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        ctx.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
     }
 
     public void Dispose()

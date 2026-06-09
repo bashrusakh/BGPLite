@@ -1,9 +1,10 @@
 using BGPLite.Api.Entities;
+using BGPLite.Server;
 using Microsoft.EntityFrameworkCore;
 
 namespace BGPLite.Api;
 
-public sealed class PeerStore
+public sealed class PeerStore : IPeerStore
 {
     private readonly BgpDbContext _db;
 
@@ -54,8 +55,11 @@ public sealed class PeerStore
     public Peer? GetPeerById(string id) =>
         _db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Id == id);
 
-    public Peer? GetPeerByIp(string ip) =>
-        _db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Ip == ip);
+    public PeerInfo? GetPeerByIp(string ip)
+    {
+        var peer = _db.Peers.Include(p => p.Communities).FirstOrDefault(p => p.Ip == ip);
+        return peer is null ? null : MapToInfo(peer);
+    }
 
     public void SetDescription(string id, string description)
     {
@@ -117,4 +121,15 @@ public sealed class PeerStore
             prefixes.Select(p => new PeerCustomPrefix { PeerId = peerId, Prefix = p.Prefix, PrefixLength = p.Length }));
         _db.SaveChanges();
     }
+
+    private static PeerInfo MapToInfo(Peer peer) => new()
+    {
+        Id = peer.Id,
+        Ip = peer.Ip,
+        Asn = peer.Asn,
+        Description = peer.Description,
+        Status = peer.Status,
+        CreatedAt = peer.CreatedAt.ToString("O"),
+        LastSessionAt = peer.LastSessionAt?.ToString("O")
+    };
 }

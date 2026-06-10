@@ -34,7 +34,7 @@ public sealed class PeerStore : IPeerStore
         var peer = db.Peers.FirstOrDefault(p => p.Ip == ip);
         if (peer is null)
         {
-            db.Peers.Add(new Peer { Ip = ip, Asn = asn, Status = "active" });
+            db.Peers.Add(new Peer { Ip = ip, Asn = asn, Status = "active", LastSessionAt = DateTime.UtcNow });
         }
         else
         {

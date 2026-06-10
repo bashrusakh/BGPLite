@@ -196,7 +196,10 @@ public sealed class BgpSession : IDisposable
             var wasEstablished = _state == BgpFsmState.Established;
             TransitionTo(BgpFsmState.Idle);
             if (wasEstablished)
+            {
                 _metrics.SessionClosed();
+                _peerStore?.UpdateSessionStatus(_peerConfig.Address, false);
+            }
             _metrics.PeerDisconnected();
             _logger.LogInformation("SessionClosed with {Peer}", _peerConfig.Address);
         }

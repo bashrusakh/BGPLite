@@ -229,7 +229,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     private ApiResponse HandleGetMe(HttpListenerContext ctx)
     {
-        var clientIp = ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
+        var clientIp = GetClientIp(ctx);
 
         var peerInfo = _store.GetPeerByIp(clientIp);
         if (peerInfo is null)
@@ -567,6 +567,21 @@ public sealed class ManagementApi : IHostedService, IDisposable
     #endregion
 
     #region Helpers
+
+    private static string GetClientIp(HttpListenerContext ctx)
+    {
+        var realIp = ctx.Request.Headers["X-Real-IP"];
+        if (!string.IsNullOrEmpty(realIp)) return realIp;
+
+        var forwarded = ctx.Request.Headers["X-Forwarded-For"];
+        if (!string.IsNullOrEmpty(forwarded))
+        {
+            var first = forwarded.Split(',')[0].Trim();
+            if (first.Length > 0) return first;
+        }
+
+        return ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
+    }
 
     private static uint ParseCommunity(string community)
     {

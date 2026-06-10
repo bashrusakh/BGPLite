@@ -5,28 +5,15 @@ namespace BGPLite.Api;
 
 public class BgpDbContext : DbContext
 {
-    private readonly string _dbPath;
-
     public DbSet<Peer> Peers => Set<Peer>();
-    public bool IsNewDatabase { get; }
 
-    public BgpDbContext(string dbPath)
+    public BgpDbContext(DbContextOptions<BgpDbContext> options) : base(options) { }
+
+    public static void Initialize(BgpDbContext db)
     {
-        _dbPath = dbPath;
-        var dir = Path.GetDirectoryName(dbPath);
-        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-            Directory.CreateDirectory(dir);
-
-        IsNewDatabase = !File.Exists(dbPath);
-        Database.EnsureCreated();
-
-        Peers.Where(p => p.Status == "active").ExecuteUpdate(
+        db.Database.EnsureCreated();
+        db.Peers.Where(p => p.Status == "active").ExecuteUpdate(
             s => s.SetProperty(p => p.Status, "inactive"));
-    }
-
-    protected override void OnConfiguring(DbContextOptionsBuilder options)
-    {
-        options.UseSqlite($"Data Source={_dbPath}");
     }
 
     protected override void OnModelCreating(ModelBuilder model)

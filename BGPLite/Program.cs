@@ -5,6 +5,7 @@ using BGPLite.Protocol;
 using BGPLite.Providers;
 using BGPLite.Routing;
 using BGPLite.Server;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Hosting;
@@ -61,14 +62,12 @@ builder.Services.AddSingleton(config);
 builder.Services.AddSingleton(config.Bgp);
 builder.Services.AddSingleton(routeTable);
 
-var db = new BgpDbContext(dbPath);
-var peerCount = db.Peers.Count();
-if (db.IsNewDatabase)
-    Console.WriteLine($"Created new database ({peerCount} peers)");
-else
-    Console.WriteLine($"Database loaded: {peerCount} peer(s)");
+builder.Services.AddDbContextFactory<BgpDbContext>(options =>
+    options.UseSqlite($"Data Source={dbPath}"));
 
-builder.Services.AddSingleton(db);
+builder.Services.AddDbContext<BgpDbContext>(options =>
+    options.UseSqlite($"Data Source={dbPath}"), ServiceLifetime.Scoped);
+
 builder.Services.AddSingleton<PeerStore>();
 builder.Services.AddSingleton<IRouteFilter>(sp =>
 {
@@ -116,6 +115,21 @@ if (config.RipeStat is { AsnLists.Count: > 0 })
 }
 
 var host = builder.Build();
+
+// Initialize DB
+var dir = Path.GetDirectoryName(dbPath);
+if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+    Directory.CreateDirectory(dir);
+
+using (var scope = host.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<BgpDbContext>();
+    BgpDbContext.Initialize(db);
+    var peerCount = db.Peers.Count();
+    Console.WriteLine(peerCount == 0
+        ? "Created new database"
+        : $"Database loaded: {peerCount} peer(s)");
+}
 
 var logger = host.Services.GetRequiredService<ILogger<Program>>();
 logger.LogInformation("BGPLite starting — ASN={Asn}, RouterId={RouterId}", config.Bgp.Asn, config.Bgp.RouterId);

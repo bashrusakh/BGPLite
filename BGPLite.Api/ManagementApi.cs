@@ -151,8 +151,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
         if (IsGet(method, segments, "api", "routes"))
             return HandleGetRoutes();
 
-        // /api/asns/{asn}/prefixes
-        if (segments.Length == 4 && segments[0] == "api" && segments[1] == "asns" && segments[3] == "prefixes" && method == "GET")
+        // /api/as/{asn}/prefixes
+        if (segments.Length == 4 && segments[0] == "api" && segments[1] == "as" && segments[3] == "prefixes" && method == "GET")
             return HandleGetAsnPrefixes(segments[2], ctx);
 
         return ApiResponse.Error("Not found", 404);
@@ -554,7 +554,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
     #endregion
 
-    #region GET /api/asns/{asn}/prefixes
+    #region GET /api/as/{asn}/prefixes
 
     private ApiResponse HandleGetAsnPrefixes(string asnStr, HttpListenerContext ctx)
     {

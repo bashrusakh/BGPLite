@@ -53,6 +53,7 @@ public class BgpDbContext : DbContext
 
         model.Entity<PeerCustomAsn>(e =>
         {
+            e.ToTable("PeerCustomAsns");
             e.HasKey(c => new { c.PeerId, c.Asn });
             e.HasOne(c => c.Peer).WithMany(p => p.CustomAsns)
                 .HasForeignKey(c => c.PeerId).OnDelete(DeleteBehavior.Cascade);

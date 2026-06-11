@@ -435,11 +435,8 @@ public sealed class BgpSession : IDisposable
 
                 _logger.LogInformation("Sending {Count} total routes to {Peer}", routes.Count, _peerConfig.Address);
 
-                if (routes.Count > 0)
-                {
-                    await SendRoutesAsync(nextHop, routes);
-                    return;
-                }
+                await SendRoutesAsync(nextHop, routes);
+                return;
             }
             else
             {

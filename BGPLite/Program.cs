@@ -135,6 +135,12 @@ var logger = host.Services.GetRequiredService<ILogger<Program>>();
 logger.LogInformation("BGPLite starting — ASN={Asn}, RouterId={RouterId}", config.Bgp.Asn, config.Bgp.RouterId);
 logger.LogInformation("Loaded routes: {RouteCount}", routeTable.Count);
 
+// Pre-warm prefix cache before accepting BGP connections
+Console.WriteLine("Warming up prefix cache...");
+var prefixService = host.Services.GetRequiredService<IPrefixService>();
+await prefixService.WarmUpAsync();
+Console.WriteLine("Prefix cache ready");
+
 await host.RunAsync();
 return;
 

@@ -78,6 +78,38 @@ public sealed class PrefixService : IPrefixService
         return GetPrefixesForAsns(ruAsns);
     }
 
+    public async Task WarmUpAsync()
+    {
+        var lists = _config.RipeStat?.AsnLists ?? [];
+
+        var allAsns = lists.SelectMany(l => l.Asns).Distinct().ToList();
+        foreach (var asn in allAsns)
+        {
+            try
+            {
+                await GetPrefixesAsync(asn);
+                Console.WriteLine($"  WarmUp: AS{asn} cached");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  WarmUp: AS{asn} failed — {ex.Message}");
+            }
+        }
+
+        if (lists.Any(l => l.Country is not null))
+        {
+            try
+            {
+                var ru = await GetRuPrefixesAsync();
+                Console.WriteLine($"  WarmUp: RU prefixes — {ru.Count} entries");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  WarmUp: RU prefixes failed — {ex.Message}");
+            }
+        }
+    }
+
     private static IReadOnlyList<(uint Prefix, byte Length)> LoadFromFile(string path)
     {
         var result = new List<(uint Prefix, byte Length)>();

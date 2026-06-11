@@ -166,6 +166,24 @@ public sealed class PeerStore : IPeerStore
         db.SaveChanges();
     }
 
+    public List<uint> GetCustomAsns(string peerId)
+    {
+        using var db = _dbFactory.CreateDbContext();
+        return db.Set<PeerCustomAsn>()
+            .Where(c => c.PeerId == peerId)
+            .Select(c => c.Asn)
+            .ToList();
+    }
+
+    public void SetCustomAsns(string peerId, List<uint> asns)
+    {
+        using var db = _dbFactory.CreateDbContext();
+        db.Set<PeerCustomAsn>().Where(c => c.PeerId == peerId).ExecuteDelete();
+        db.Set<PeerCustomAsn>().AddRange(
+            asns.Select(a => new PeerCustomAsn { PeerId = peerId, Asn = a }));
+        db.SaveChanges();
+    }
+
     private static PeerInfo MapToInfo(Peer peer) => new()
     {
         Id = peer.Id,

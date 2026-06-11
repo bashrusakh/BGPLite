@@ -12,6 +12,11 @@ public class BgpDbContext : DbContext
     public static void Initialize(BgpDbContext db)
     {
         db.Database.EnsureCreated();
+        db.Database.ExecuteSqlRaw(
+            "CREATE TABLE IF NOT EXISTS PeerCustomAsns (" +
+            "PeerId TEXT NOT NULL, Asn INTEGER NOT NULL, " +
+            "PRIMARY KEY (PeerId, Asn), " +
+            "FOREIGN KEY (PeerId) REFERENCES Peers(Id) ON DELETE CASCADE)");
         db.Peers.Where(p => p.Status == "active").ExecuteUpdate(
             s => s.SetProperty(p => p.Status, "inactive"));
     }
@@ -43,6 +48,13 @@ public class BgpDbContext : DbContext
         {
             e.HasKey(c => new { c.PeerId, c.Prefix, c.PrefixLength });
             e.HasOne(c => c.Peer).WithMany(p => p.CustomPrefixes)
+                .HasForeignKey(c => c.PeerId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        model.Entity<PeerCustomAsn>(e =>
+        {
+            e.HasKey(c => new { c.PeerId, c.Asn });
+            e.HasOne(c => c.Peer).WithMany(p => p.CustomAsns)
                 .HasForeignKey(c => c.PeerId).OnDelete(DeleteBehavior.Cascade);
         });
     }

@@ -10,6 +10,7 @@ public interface IPeerStore
     PeerInfo? GetPeerById(string id);
     List<string> GetSubscriptions(string peerId);
     List<string> GetCustomPrefixes(string peerId);
+    List<uint> GetCustomAsns(string peerId);
     HashSet<uint> GetCommunities(string peerId);
     void SetCommunities(string peerId, HashSet<uint> communities);
     void ClearCommunities(string peerId);

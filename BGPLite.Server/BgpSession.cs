@@ -407,6 +407,32 @@ public sealed class BgpSession : IDisposable
                     });
                 }
 
+                // Add custom AS prefixes
+                var customAsns = _peerStore.GetCustomAsns(peer.Id);
+                if (customAsns.Count > 0)
+                {
+                    try
+                    {
+                        var asnPrefixes = await _prefixService.GetPrefixesForAsns(customAsns);
+                        foreach (var (prefix, length, asn) in asnPrefixes)
+                        {
+                            routes.Add(new Route
+                            {
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop,
+                                AsPath = [asn]
+                            });
+                        }
+                        _logger.LogInformation("Peer {Peer} custom AS: {Asns} -> {Count} prefixes",
+                            _peerConfig.Address, string.Join(",", customAsns), asnPrefixes.Count);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch custom AS prefixes for {Peer}", _peerConfig.Address);
+                    }
+                }
+
                 _logger.LogInformation("Sending {Count} total routes to {Peer}", routes.Count, _peerConfig.Address);
 
                 if (routes.Count > 0)

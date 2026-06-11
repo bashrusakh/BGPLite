@@ -249,6 +249,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
         var subscriptions = _store.GetSubscriptions(peer.Id);
         var customPrefixes = _store.GetCustomPrefixes(peer.Id);
+        var customAsns = _store.GetCustomAsns(peer.Id);
         var communities = _store.GetCommunitiesByIp(clientIp);
 
         return ApiResponse.Ok(new
@@ -265,6 +266,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
                 lastSessionAt = peer.LastSessionAt,
                 lists = subscriptions,
                 customPrefixes,
+                customAsns,
                 communities = communities.Select(CommunityToString),
                 allRoutes = communities.Count == 0
             }
@@ -305,11 +307,13 @@ public sealed class ManagementApi : IHostedService, IDisposable
             _store.SetSubscriptions(id, asnLists);
         if (customPrefixes.Count > 0)
             _store.SetCustomPrefixes(id, customPrefixes);
+        if (data.CustomAsns is { Count: > 0 })
+            _store.SetCustomAsns(id, data.CustomAsns);
 
         var peer = _store.GetDbPeerById(id);
 
-        _logger.LogInformation("Created peer {Ip} AS{Asn} ({Id}): {Subs} lists, {Prefixes} custom prefixes",
-            data.Ip, data.Asn, id, asnLists.Count, customPrefixes.Count);
+        _logger.LogInformation("Created peer {Ip} AS{Asn} ({Id}): {Subs} lists, {Prefixes} custom prefixes, {Asns} custom AS",
+            data.Ip, data.Asn, id, asnLists.Count, customPrefixes.Count, data.CustomAsns?.Count ?? 0);
 
         if (_sessionManager is not null)
             _ = _sessionManager.RefreshPeerAsync(data.Ip);
@@ -323,7 +327,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
             status = peer?.Status ?? "inactive",
             createdAt = peer?.CreatedAt,
             lists = asnLists,
-            customPrefixes = data.CustomPrefixes ?? []
+            customPrefixes = data.CustomPrefixes ?? [],
+            customAsns = data.CustomAsns ?? []
         });
     }
 
@@ -335,6 +340,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
 
         var subscriptions = _store.GetSubscriptions(peer.Id);
         var customPrefixes = _store.GetCustomPrefixes(peer.Id);
+        var customAsns = _store.GetCustomAsns(peer.Id);
         var communities = _store.GetCommunitiesByIp(peer.Ip);
 
         return ApiResponse.Ok(new
@@ -348,6 +354,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
             lastSessionAt = peer.LastSessionAt,
             lists = subscriptions,
             customPrefixes,
+            customAsns,
             communities = communities.Select(CommunityToString),
             allRoutes = communities.Count == 0
         });
@@ -383,6 +390,9 @@ public sealed class ManagementApi : IHostedService, IDisposable
             }
             _store.SetCustomPrefixes(peerId, parsed);
         }
+
+        if (data.CustomAsns is not null)
+            _store.SetCustomAsns(peerId, data.CustomAsns);
 
         _logger.LogInformation("Updated peer {Id}", peerId);
 
@@ -630,8 +640,8 @@ public sealed class ManagementApi : IHostedService, IDisposable
         _listener?.Close();
     }
 
-    private record CreatePeerRequest(string Ip, uint Asn, string? Description, [property: JsonPropertyName("lists")] List<string>? AsnLists, List<string>? CustomPrefixes);
-    private record UpdatePeerRequest(string? Description, [property: JsonPropertyName("lists")] List<string>? Lists, List<string>? CustomPrefixes);
+    private record CreatePeerRequest(string Ip, uint Asn, string? Description, [property: JsonPropertyName("lists")] List<string>? AsnLists, List<string>? CustomPrefixes, List<uint>? CustomAsns);
+    private record UpdatePeerRequest(string? Description, [property: JsonPropertyName("lists")] List<string>? Lists, List<string>? CustomPrefixes, List<uint>? CustomAsns);
 
     private record ApiResponse(object? Body, int StatusCode = 200)
     {

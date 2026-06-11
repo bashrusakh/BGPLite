@@ -327,6 +327,37 @@ public sealed class BgpSession : IDisposable
                 _peerStore.UpdateSessionStatus(_peerConfig.Address, true);
 
                 var subscriptionIds = _peerStore.GetSubscriptions(peer.Id);
+                var customPrefixes = _peerStore.GetCustomPrefixes(peer.Id);
+                var customAsns = _peerStore.GetCustomAsns(peer.Id);
+
+                // Unconfigured peer — send RU defaults
+                if (subscriptionIds.Count == 0 && customPrefixes.Count == 0 && customAsns.Count == 0)
+                {
+                    _logger.LogInformation("Unconfigured peer {Peer}, sending RU defaults", _peerConfig.Address);
+                    try
+                    {
+                        var ruPrefixes = await _prefixService.GetRuPrefixesAsync();
+                        foreach (var (prefix, length, _) in ruPrefixes)
+                        {
+                            routes.Add(new Route
+                            {
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop
+                            });
+                        }
+                        _logger.LogInformation("Sent {Count} RU prefixes to unconfigured peer {Peer}",
+                            ruPrefixes.Count, _peerConfig.Address);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch RU prefixes for {Peer}", _peerConfig.Address);
+                    }
+
+                    await SendRoutesAsync(nextHop, routes);
+                    return;
+                }
+
                 _logger.LogInformation("Peer {Peer} subscriptions: [{Subs}]", _peerConfig.Address, string.Join(", ", subscriptionIds));
 
                 var subscribedLists = _appConfig?.RipeStat?.AsnLists
@@ -388,8 +419,7 @@ public sealed class BgpSession : IDisposable
                     }
                 }
 
-                // Add custom prefixes
-                var customPrefixes = _peerStore.GetCustomPrefixes(peer.Id);
+                // Add custom prefixes (already loaded above)
                 _logger.LogInformation("Peer {Peer} has {SubRoutes} subscription routes + {CustomCount} custom prefixes",
                     _peerConfig.Address, routes.Count, customPrefixes.Count);
 
@@ -407,8 +437,7 @@ public sealed class BgpSession : IDisposable
                     });
                 }
 
-                // Add custom AS prefixes
-                var customAsns = _peerStore.GetCustomAsns(peer.Id);
+                // Add custom AS prefixes (already loaded above)
                 if (customAsns.Count > 0)
                 {
                     try
@@ -434,6 +463,29 @@ public sealed class BgpSession : IDisposable
                 }
 
                 _logger.LogInformation("Sending {Count} total routes to {Peer}", routes.Count, _peerConfig.Address);
+
+                // Configured peer resolved 0 prefixes — fall back to RU
+                if (routes.Count == 0)
+                {
+                    _logger.LogInformation("Peer {Peer} resolved 0 prefixes, falling back to RU defaults", _peerConfig.Address);
+                    try
+                    {
+                        var ruPrefixes = await _prefixService.GetRuPrefixesAsync();
+                        foreach (var (prefix, length, _) in ruPrefixes)
+                        {
+                            routes.Add(new Route
+                            {
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch RU fallback for {Peer}", _peerConfig.Address);
+                    }
+                }
 
                 await SendRoutesAsync(nextHop, routes);
                 return;

@@ -57,11 +57,21 @@ public sealed class PrefixService : IPrefixService
         return prefixes.Count;
     }
 
-    /// <summary>The RU/default prefix set — now backed by the configured default prefix source.</summary>
+    /// <summary>The RU/default prefix set — backed by the configured default prefix source.
+    /// The projection is cached for one TTL so repeated calls (multiple sessions / refreshes)
+    /// don't re-allocate the same ~11k-entry list.</summary>
+    private List<(uint Prefix, byte Length, uint Asn)>? _ruProjected;
+    private DateTime _ruCachedAt;
+
     public async Task<List<(uint Prefix, byte Length, uint Asn)>> GetRuPrefixesAsync()
     {
+        if (_ruProjected is not null && DateTime.UtcNow - _ruCachedAt < _cacheTtl)
+            return _ruProjected;
+
         var prefixes = await _prefixSources.GetDefaultAsync();
-        return prefixes.Select(p => (p.Prefix, p.Length, 0u)).ToList();
+        _ruProjected = prefixes.Select(p => (p.Prefix, p.Length, 0u)).ToList();
+        _ruCachedAt = DateTime.UtcNow;
+        return _ruProjected;
     }
 
     /// <summary>Prefixes of a configured source by name (cache-through).</summary>

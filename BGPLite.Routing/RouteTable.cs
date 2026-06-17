@@ -26,6 +26,9 @@ public sealed class RouteTable
     public IReadOnlyList<Route> GetAll() =>
         _routes.Values.ToList();
 
+    /// <summary>Enumerates current routes without materializing a snapshot list (one allocation fewer than GetAll).</summary>
+    public IEnumerable<Route> Enumerate() => _routes.Values;
+
     public void Clear() =>
         _routes.Clear();
 }

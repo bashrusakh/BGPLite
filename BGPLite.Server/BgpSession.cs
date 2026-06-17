@@ -605,14 +605,8 @@ public sealed class BgpSession : IDisposable
         if (allCommunities.Length > 0)
             attrs.Add(AttributeHelper.WriteCommunities(allCommunities));
 
-        var update = new BgpUpdateMessage
-        {
-            PathAttributes = attrs,
-            Nlri = routes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList()
-        };
-
-        await SendMessageAsync(update);
-        _metrics.UpdateSent();
+        var nlri = routes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList();
+        await SendUpdateBatchAsync(attrs, nlri);
     }
 
     private async Task SendUpdateBatchAsync(List<PathAttribute> attrs, List<IpPrefix> nlri)

@@ -180,7 +180,14 @@ public sealed class BgpSession : IDisposable
             // Send initial routes. Hold the send lock so _advertisedPrefixes stays consistent
             // w.r.t. a RefreshRoutesAsync fired from the API the instant IsEstablished became true.
             await _sendLock.WaitAsync(linkedCts.Token);
-            try { await SendAllRoutesAsync(); }
+            try
+            {
+                await SendAllRoutesAsync();
+                // End-of-RIB once the initial dump is complete (RFC 4724 §4.1): lets GR-capable
+                // peers finalize stale routes. Tied to session establishment, so NOT sent on refresh.
+                if (_bgpConfig.GracefulRestart)
+                    await SendEndOfRibAsync();
+            }
             finally { _sendLock.Release(); }
 
             // Run main loop: read messages + send keepalives
@@ -713,6 +720,19 @@ public sealed class BgpSession : IDisposable
         _metrics.UpdateSent();
     }
 
+    /// <summary>
+    /// End-of-RIB marker for IPv4 unicast (RFC 4724 §2): a minimum-length UPDATE (no withdrawn
+    /// routes, no path attributes, no NLRI). Signals completion of the initial routing update so
+    /// GR-capable peers finalize — replacing stale routes with what we re-advertised and purging
+    /// the rest. Caller already holds _sendLock.
+    /// </summary>
+    private async Task SendEndOfRibAsync()
+    {
+        await WriteMessageAsync(new BgpUpdateMessage());
+        _metrics.UpdateSent();
+        _logger.LogDebug("End-of-RIB sent to {Peer}", _peerConfig.Address);
+    }
+
     #region Message I/O
 
     private async Task<BgpMessage> ReceiveMessageAsync(CancellationToken cancellationToken)
@@ -802,6 +822,20 @@ public sealed class BgpSession : IDisposable
         if (remoteOpen.Capabilities.Any(c => c.Code == BgpConstants.Capability.RouteRefresh))
             capabilities.Add(BgpCapabilityInfo.RouteRefresh());
 
+        // Advertise Graceful Restart (RFC 4724) so GR-capable peers retain our routes across our
+        // restart. R=1: every app start is treated as a restart (harmless on first connect, reduces
+        // churn on transient reconnects; proper restart detection would need a persisted generation
+        // counter — future work). F reflects whether forwarding state is preserved and is configurable
+        // (the peer keeps stale routes only while F=1, RFC 4724 §4.2). Restart Time is clamped to
+        // <= HoldTime here and to the 12-bit field max in the codec. Advertised unconditionally when
+        // enabled (RFC 4724 §4 recommends it; non-GR peers safely ignore it per RFC 5492).
+        if (_bgpConfig.GracefulRestart)
+        {
+            var restartTime = (ushort)Math.Min(_bgpConfig.RestartTime, _bgpConfig.HoldTime);
+            capabilities.Add(BgpCapabilityInfo.GracefulRestart(
+                restartState: true, restartTime, forwardingState: _bgpConfig.GracefulRestartForwardingState));
+        }
+
         var asn16 = _bgpConfig.Asn > ushort.MaxValue ? (ushort)23456 : (ushort)_bgpConfig.Asn;
         var routerId = BgpConstants.IPAddressToUint(_bgpConfig.GetRouterIdAddress());
 
@@ -872,6 +906,13 @@ public sealed class BgpSession : IDisposable
         var localRouterId = BgpConstants.IPAddressToUint(_bgpConfig.GetRouterIdAddress());
         if (open.RouterId == localRouterId)
             throw new BgpNotificationException(BgpConstants.Error.OpenMessageError, BgpConstants.SubError.BadBgpIdentifier, "BGP identifier collision with local RouterId");
+
+        var peerGr = CapabilityHelper.GetGracefulRestart(open);
+        _logger.LogInformation("Peer {Peer} Graceful Restart: {State}",
+            _peerConfig.Address,
+            peerGr.HasValue
+                ? $"supported (restartState={peerGr.Value.RestartState}, restartTime={peerGr.Value.RestartTime}s, IPv4/Unicast forwarding={peerGr.Value.Ipv4UnicastForwarding})"
+                : "not supported");
 
         _negotiatedHoldTime = holdTime;
         _keepAliveInterval = holdTime == 0

@@ -41,4 +41,18 @@ public static class CapabilityHelper
     {
         return GetRemoteAsn(open) ?? open.Asn;
     }
+
+    /// <summary>Returns the peer's Graceful Restart parameters, or null if not advertised / malformed.</summary>
+    public static (bool RestartState, ushort RestartTime, bool Ipv4UnicastForwarding)? GetGracefulRestart(BgpOpenMessage open)
+    {
+        foreach (var cap in open.Capabilities)
+        {
+            if (cap.Code == BgpConstants.Capability.GracefulRestart)
+            {
+                var parsed = BgpCapabilityInfo.TryParseGracefulRestart(cap.Data);
+                if (parsed.HasValue) return parsed;
+            }
+        }
+        return null;
+    }
 }

@@ -23,6 +23,7 @@ public sealed class BgpSession : IDisposable
     private readonly IPeerStore? _peerStore;
     private readonly IPrefixService? _prefixService;
     private readonly AppConfig? _appConfig;
+    private readonly IPrefixAggregator _prefixAggregator;
 
     private BgpFsmState _state = BgpFsmState.Idle;
     private uint _remoteAsn;
@@ -92,7 +93,8 @@ public sealed class BgpSession : IDisposable
         Action<string, uint>? onPeerIdentified = null,
         IPeerStore? peerStore = null,
         IPrefixService? prefixService = null,
-        AppConfig? appConfig = null)
+        AppConfig? appConfig = null,
+        IPrefixAggregator? prefixAggregator = null)
     {
         _socket = socket;
         _stream = new NetworkStream(socket, ownsSocket: true);
@@ -106,6 +108,7 @@ public sealed class BgpSession : IDisposable
         _peerStore = peerStore;
         _prefixService = prefixService;
         _appConfig = appConfig;
+        _prefixAggregator = prefixAggregator ?? new ExactUnionPrefixAggregator();
     }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
@@ -609,6 +612,15 @@ public sealed class BgpSession : IDisposable
 
     private async Task SendRoutesAsync(uint nextHop, List<Route> routes)
     {
+        // Summarize before sending: merge adjacent/overlapping prefixes into the minimal
+        // exact set (no extra IPs). Choke point for both initial send and RefreshRoutesAsync,
+        // so _advertisedPrefixes stays consistent with what we later withdraw.
+        var aggregated = _prefixAggregator.Aggregate(routes);
+        if (_logger.IsEnabled(LogLevel.Information) && aggregated.Count != routes.Count)
+            _logger.LogInformation("Aggregated {Before} -> {After} prefixes for {Peer}",
+                routes.Count, aggregated.Count, _peerConfig.Address);
+        routes = aggregated as List<Route> ?? aggregated.ToList();
+
         const int maxNlriPerUpdate = 100;
         _advertisedPrefixes.EnsureCapacity(_advertisedPrefixes.Count + routes.Count);
         var sent = 0;
@@ -637,24 +649,56 @@ public sealed class BgpSession : IDisposable
 
     private async Task SendRouteBatchAsync(uint nextHop, List<Route> routes)
     {
-        // Collect all unique communities from batch
-        var allCommunities = routes
-            .SelectMany(r => r.Communities)
-            .Distinct()
-            .ToArray();
-
-        var attrs = new List<PathAttribute>
+        // The COMMUNITY path attribute applies to EVERY NLRI in an UPDATE, so partition the
+        // batch by community set and emit one UPDATE per set. Otherwise prefixes belonging to
+        // one group would be tagged with another group's communities on the wire.
+        foreach (var groupRoutes in GroupByCommunitySet(routes))
         {
-            AttributeHelper.WriteOrigin(BgpOrigin.Igp),
-            AttributeHelper.WriteAsPath([_bgpConfig.Asn], _localFourByteAsn),
-            AttributeHelper.WriteNextHop(nextHop)
-        };
+            var attrs = new List<PathAttribute>
+            {
+                AttributeHelper.WriteOrigin(BgpOrigin.Igp),
+                AttributeHelper.WriteAsPath([_bgpConfig.Asn], _localFourByteAsn),
+                AttributeHelper.WriteNextHop(nextHop)
+            };
 
-        if (allCommunities.Length > 0)
-            attrs.Add(AttributeHelper.WriteCommunities(allCommunities));
+            var communities = groupRoutes[0].Communities;
+            if (communities.Length > 0)
+                attrs.Add(AttributeHelper.WriteCommunities(communities));
 
-        var nlri = routes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList();
-        await SendUpdateBatchAsync(attrs, nlri);
+            var nlri = groupRoutes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList();
+            await SendUpdateBatchAsync(attrs, nlri);
+        }
+    }
+
+    /// <summary>
+    /// Partitions routes into groups that share an identical community set, so each emitted
+    /// UPDATE carries a single COMMUNITY attribute. Internal for test coverage.
+    /// </summary>
+    internal static List<List<Route>> GroupByCommunitySet(IReadOnlyList<Route> routes) =>
+        routes.GroupBy(r => r.Communities, CommunitySetComparer.Instance)
+              .Select(g => g.ToList())
+              .ToList();
+
+    /// <summary>Sequence equality over a route's community array (set-equivalence within a batch).</summary>
+    private sealed class CommunitySetComparer : IEqualityComparer<uint[]>
+    {
+        public static readonly CommunitySetComparer Instance = new();
+
+        public bool Equals(uint[]? x, uint[]? y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x is null || y is null || x.Length != y.Length) return false;
+            for (var i = 0; i < x.Length; i++)
+                if (x[i] != y[i]) return false;
+            return true;
+        }
+
+        public int GetHashCode(uint[] obj)
+        {
+            var hc = new HashCode();
+            foreach (var c in obj) hc.Add(c);
+            return hc.ToHashCode();
+        }
     }
 
     private async Task SendUpdateBatchAsync(List<PathAttribute> attrs, List<IpPrefix> nlri)

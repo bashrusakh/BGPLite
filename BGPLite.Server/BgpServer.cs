@@ -20,6 +20,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     private readonly Action<string, uint>? _onPeerIdentified;
     private readonly IPeerStore? _peerStore;
     private readonly IPrefixService? _prefixService;
+    private readonly IPrefixAggregator _prefixAggregator;
     private readonly ConcurrentDictionary<string, BgpSession> _sessions = new();
     private readonly CancellationTokenSource _cts = new();
     private Socket? _listener;
@@ -39,7 +40,8 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
         ILogger<BgpServer> logger,
         Action<string, uint>? onPeerIdentified = null,
         IPeerStore? peerStore = null,
-        IPrefixService? prefixService = null)
+        IPrefixService? prefixService = null,
+        IPrefixAggregator? prefixAggregator = null)
     {
         _config = config;
         _routeTable = routeTable;
@@ -50,6 +52,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
         _onPeerIdentified = onPeerIdentified;
         _peerStore = peerStore;
         _prefixService = prefixService;
+        _prefixAggregator = prefixAggregator ?? new ExactUnionPrefixAggregator();
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -117,7 +120,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                     socket, peerConfig, _config.Bgp, _routeTable,
                     _routeFilter, _metrics, _sessionLogger,
                     _onPeerIdentified,
-                    _peerStore, _prefixService, _config);
+                    _peerStore, _prefixService, _config, _prefixAggregator);
 
                 _sessions[peerAddress] = session;
 

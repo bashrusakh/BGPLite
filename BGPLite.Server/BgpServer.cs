@@ -76,6 +76,22 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("BGP server shutting down");
+
+        // Graceful Restart-aware shutdown (RFC 4724 §4): a NOTIFICATION termination bypasses GR, so
+        // send a Cease only when GR is disabled — peers then tear down cleanly instead of waiting on
+        // the hold timer. With GR enabled we deliberately just drop the TCP connection so peers
+        // engage GR and retain our routes across the restart. Must run BEFORE _cts.Cancel() tears
+        // the sessions down.
+        if (!_config.Bgp.GracefulRestart)
+        {
+            var ceases = _sessions.Values
+                .Where(s => s.IsEstablished)
+                .Select(s => s.NotifyCeaseAsync())
+                .ToArray();
+            if (ceases.Length > 0)
+                await Task.WhenAll(ceases);
+        }
+
         _cts.Cancel();
 
         if (_listener is not null)

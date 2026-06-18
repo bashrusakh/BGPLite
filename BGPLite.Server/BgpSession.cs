@@ -878,6 +878,25 @@ public sealed class BgpSession : IDisposable
         _logger.LogInformation("NotificationSent to {Peer}: {Error}/{SubError}", _peerConfig.Address, errorCode, subErrorCode);
     }
 
+    /// <summary>
+    /// Best-effort Cease NOTIFICATION for graceful shutdown (RFC 4271 §6.2). The caller (BgpServer)
+    /// should only invoke this on an Established session and only when Graceful Restart is disabled —
+    /// a NOTIFICATION termination bypasses GR (RFC 4724 §4), so with GR on we drop the TCP connection
+    /// instead to let peers retain our routes. Write/IO errors are swallowed (we are shutting down).
+    /// </summary>
+    public async Task NotifyCeaseAsync()
+    {
+        try
+        {
+            await SendNotificationAsync(BgpConstants.Error.Cease, BgpConstants.SubError.Unspecific);
+            _logger.LogInformation("Cease sent to {Peer} on shutdown", _peerConfig.Address);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to send Cease to {Peer} on shutdown", _peerConfig.Address);
+        }
+    }
+
     #endregion
 
     #region Validation

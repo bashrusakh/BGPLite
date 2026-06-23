@@ -71,6 +71,14 @@ public static class BgpConstants
         public const byte Multiprotocol = 1;
         public const byte RouteRefresh = 2;
         public const byte FourOctetAsn = 65;
+        public const byte GracefulRestart = 64; // RFC 4724
+    }
+
+    /// <summary>Flag bits for the Graceful Restart capability (RFC 4724).</summary>
+    public static class GracefulRestartFlag
+    {
+        public const byte RestartState = 0x80;  // R bit — most significant bit of Restart Flags
+        public const byte ForwardingState = 0x80; // F bit — most significant bit of per-AF Flags
     }
 
     public static class Afi

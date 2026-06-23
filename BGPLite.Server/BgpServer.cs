@@ -20,6 +20,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     private readonly Action<string, uint>? _onPeerIdentified;
     private readonly IPeerStore? _peerStore;
     private readonly IPrefixService? _prefixService;
+    private readonly IPrefixAggregator _prefixAggregator;
     private readonly ConcurrentDictionary<string, BgpSession> _sessions = new();
     private readonly CancellationTokenSource _cts = new();
     private Socket? _listener;
@@ -39,7 +40,8 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
         ILogger<BgpServer> logger,
         Action<string, uint>? onPeerIdentified = null,
         IPeerStore? peerStore = null,
-        IPrefixService? prefixService = null)
+        IPrefixService? prefixService = null,
+        IPrefixAggregator? prefixAggregator = null)
     {
         _config = config;
         _routeTable = routeTable;
@@ -50,6 +52,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
         _onPeerIdentified = onPeerIdentified;
         _peerStore = peerStore;
         _prefixService = prefixService;
+        _prefixAggregator = prefixAggregator ?? new ExactUnionPrefixAggregator();
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -73,6 +76,22 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("BGP server shutting down");
+
+        // Graceful Restart-aware shutdown (RFC 4724 §4): a NOTIFICATION termination bypasses GR, so
+        // send a Cease only when GR is disabled — peers then tear down cleanly instead of waiting on
+        // the hold timer. With GR enabled we deliberately just drop the TCP connection so peers
+        // engage GR and retain our routes across the restart. Must run BEFORE _cts.Cancel() tears
+        // the sessions down.
+        if (!_config.Bgp.GracefulRestart)
+        {
+            var ceases = _sessions.Values
+                .Where(s => s.IsEstablished)
+                .Select(s => s.NotifyCeaseAsync())
+                .ToArray();
+            if (ceases.Length > 0)
+                await Task.WhenAll(ceases);
+        }
+
         _cts.Cancel();
 
         if (_listener is not null)
@@ -117,7 +136,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                     socket, peerConfig, _config.Bgp, _routeTable,
                     _routeFilter, _metrics, _sessionLogger,
                     _onPeerIdentified,
-                    _peerStore, _prefixService, _config);
+                    _peerStore, _prefixService, _config, _prefixAggregator);
 
                 _sessions[peerAddress] = session;
 
@@ -155,8 +174,20 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 
     public async Task RefreshPeerAsync(string peerIp)
     {
-        if (_sessions.TryGetValue(peerIp, out var session) && session.IsEstablished)
-            await session.RefreshRoutesAsync();
+        if (!_sessions.TryGetValue(peerIp, out var session))
+        {
+            _logger.LogWarning("RefreshPeer: no session for {Ip} (active: [{Peers}])",
+                peerIp, string.Join(", ", _sessions.Keys));
+            return;
+        }
+
+        if (!session.IsEstablished)
+        {
+            _logger.LogWarning("RefreshPeer: session for {Ip} not established (state={State})", peerIp, session.State);
+            return;
+        }
+
+        await session.RefreshRoutesAsync();
     }
 
     public List<string> GetActivePeerIps() =>

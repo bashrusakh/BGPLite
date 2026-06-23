@@ -1,7 +1,5 @@
 using System.Collections.Concurrent;
-using System.Net;
 using BGPLite.Configuration;
-using BGPLite.Protocol;
 using BGPLite.Server;
 
 namespace BGPLite.Providers;
@@ -9,19 +7,17 @@ namespace BGPLite.Providers;
 public sealed class PrefixService : IPrefixService
 {
     private readonly RipeStatProvider? _ripeStat;
+    private readonly IPrefixSourceService _prefixSources;
     private readonly AppConfig _config;
     private readonly ConcurrentDictionary<uint, (IReadOnlyList<(uint Prefix, byte Length)> Data, DateTime CachedAt)> _cache = new();
     private readonly TimeSpan _cacheTtl;
-    private IReadOnlyList<(uint Prefix, byte Length)>? _localPrefixes;
 
-    public PrefixService(AppConfig config, string? netsPath = null, RipeStatProvider? ripeStat = null, TimeSpan? cacheTtl = null)
+    public PrefixService(AppConfig config, RipeStatProvider? ripeStat, IPrefixSourceService prefixSources, TimeSpan? cacheTtl = null)
     {
         _config = config;
         _ripeStat = ripeStat;
+        _prefixSources = prefixSources;
         _cacheTtl = cacheTtl ?? TimeSpan.FromHours(1);
-
-        if (netsPath is not null && File.Exists(netsPath))
-            _localPrefixes = LoadFromFile(netsPath);
     }
 
     public async Task<IReadOnlyList<(uint Prefix, byte Length)>> GetPrefixesAsync(uint asn)
@@ -61,24 +57,26 @@ public sealed class PrefixService : IPrefixService
         return prefixes.Count;
     }
 
-    public Task<List<(uint Prefix, byte Length, uint Asn)>> GetRuPrefixesAsync()
+    /// <summary>The RU/default prefix set — backed by the configured default prefix source.
+    /// The projection is cached for one TTL so repeated calls (multiple sessions / refreshes)
+    /// don't re-allocate the same ~11k-entry list.</summary>
+    private List<(uint Prefix, byte Length, uint Asn)>? _ruProjected;
+    private DateTime _ruCachedAt;
+
+    public async Task<List<(uint Prefix, byte Length, uint Asn)>> GetRuPrefixesAsync()
     {
-        if (_localPrefixes is not null)
-            return Task.FromResult(_localPrefixes.Select(p => (p.Prefix, p.Length, 0u)).ToList());
+        if (_ruProjected is not null && DateTime.UtcNow - _ruCachedAt < _cacheTtl)
+            return _ruProjected;
 
-        return Task.FromResult(new List<(uint, byte, uint)>());
-
-        // // Fallback: если нет локального файла, попробуем RIPE
-        // if (_ripeStat is null) return Task.FromResult(new List<(uint, byte, uint)>());
-        //
-        // var ruAsns = _config.RipeStat?.AsnLists
-        //     .Where(l => l.Country == "RU")
-        //     .SelectMany(l => l.Asns)
-        //     .ToList();
-        //
-        // if (ruAsns is null or { Count: 0 }) return Task.FromResult(new List<(uint, byte, uint)>());
-        // return GetPrefixesForAsns(ruAsns);
+        var prefixes = await _prefixSources.GetDefaultAsync();
+        _ruProjected = prefixes.Select(p => (p.Prefix, p.Length, 0u)).ToList();
+        _ruCachedAt = DateTime.UtcNow;
+        return _ruProjected;
     }
+
+    /// <summary>Prefixes of a configured source by name (cache-through).</summary>
+    public Task<IReadOnlyList<(uint Prefix, byte Length)>> GetSourcePrefixesAsync(string name) =>
+        _prefixSources.GetAsync(name);
 
     public async Task WarmUpAsync()
     {
@@ -98,34 +96,7 @@ public sealed class PrefixService : IPrefixService
             }
         }
 
-        if (lists.Any(l => l.Country is not null))
-        {
-            try
-            {
-                var ru = await GetRuPrefixesAsync();
-                Console.WriteLine($"  WarmUp: RU prefixes — {ru.Count} entries");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  WarmUp: RU prefixes failed — {ex.Message}");
-            }
-        }
-    }
-
-    private static IReadOnlyList<(uint Prefix, byte Length)> LoadFromFile(string path)
-    {
-        var result = new List<(uint Prefix, byte Length)>();
-        foreach (var line in File.ReadLines(path))
-        {
-            var trimmed = line.Trim();
-            if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith('#')) continue;
-
-            var slash = trimmed.IndexOf('/');
-            var ip = IPAddress.Parse(trimmed[..slash]);
-            var length = byte.Parse(trimmed[(slash + 1)..]);
-            var prefix = BgpConstants.IPAddressToUint(ip);
-            result.Add((prefix, length));
-        }
-        return result;
+        // Pre-load all configured prefix sources (file/HTTP/...) into the in-memory cache.
+        await _prefixSources.WarmUpAsync();
     }
 }

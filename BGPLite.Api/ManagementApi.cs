@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using BGPLite.Api.Entities;
 using BGPLite.Configuration;
 using BGPLite.Protocol;
+using BGPLite.Providers;
 using BGPLite.Routing;
 using BGPLite.Server;
 using Microsoft.Extensions.Hosting;
@@ -19,6 +20,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
     private readonly AppConfig _config;
     private readonly BgpMetrics _metrics;
     private readonly IPrefixService? _prefixService;
+    private readonly IPrefixSourceService? _prefixSources;
     private readonly ISessionManager? _sessionManager;
     private readonly ILogger<ManagementApi> _logger;
     private readonly int _port;
@@ -33,6 +35,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
         BgpMetrics metrics,
         ILogger<ManagementApi> logger,
         IPrefixService? prefixService = null,
+        IPrefixSourceService? prefixSources = null,
         ISessionManager? sessionManager = null)
     {
         _store = store;
@@ -40,6 +43,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
         _config = config;
         _metrics = metrics;
         _prefixService = prefixService;
+        _prefixSources = prefixSources;
         _sessionManager = sessionManager;
         _logger = logger;
         _port = config.ApiPort;
@@ -218,15 +222,11 @@ public sealed class ManagementApi : IHostedService, IDisposable
             },
             mikrotik = new[]
             {
-                $"/routing bgp connection",
-                $"add name=bgplite remote.address={ip}/32 remote.as={bgp.Asn}",
-                $"  local.default-address=<YOUR_IP> local.role=ebgp",
-                $"  as=<YOUR_ASN> multihop=yes hold-time={bgp.HoldTime}s afi=ip",
-                $"  output.filter-chain=discard output.no-client-to-client-reflection=yes",
-                $"  input.filter=bgplite-in",
-                $"!",
-                $"/routing filter rule",
-                $"add chain=bgplite-in action=accept set-in-nexthop-direct=yes"
+                $"# Apply all lines as-is — full paths => one paste. v7 ties a connection to a BGP instance; output.filter-chain=discard announces nothing back.",
+                $"/routing/bgp/instance/add name=bgplite as=<YOUR_ASN> router-id=<YOUR_ROUTER_ID>",
+                $"/routing/filter/rule/add chain=discard rule=\"reject;\"",
+                $"/routing/filter/rule/add chain=bgplite-in rule=\"set gw <YOUR_GW>; accept;\"",
+                $"/routing/bgp/connection/add name=bgplite instance=bgplite afi=ip remote.address={ip}/32 remote.as={bgp.Asn} local.role=ebgp hold-time={bgp.HoldTime}s output.filter-chain=discard input.filter=bgplite-in"
             }
         });
     }
@@ -267,7 +267,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
                 lists = subscriptions,
                 customPrefixes,
                 customAsns,
-                communities = communities.Select(CommunityToString),
+                communities = communities.Select(CommunityCodec.Format),
                 allRoutes = communities.Count == 0
             }
         });
@@ -357,7 +357,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
             lists = subscriptions,
             customPrefixes,
             customAsns,
-            communities = communities.Select(CommunityToString),
+            communities = communities.Select(CommunityCodec.Format),
             allRoutes = communities.Count == 0
         });
     }
@@ -521,6 +521,26 @@ public sealed class ManagementApi : IHostedService, IDisposable
             });
         }
 
+        // Append configured PrefixSources (file/http) alongside the legacy RipeStat ASN-lists,
+        // reusing the same response shape. "Kind" is intentionally not exposed.
+        if (_prefixSources is not null)
+        {
+            var seen = lists.Select(l => l.Name).ToHashSet();
+            foreach (var (source, prefixes) in await _prefixSources.LoadAllAsync())
+            {
+                if (!seen.Add(source.Name)) continue; // skip names already present (e.g. shared "ru")
+                result.Add(new
+                {
+                    id = source.Name,
+                    Name = source.Name,
+                    Description = source.Description,
+                    Country = (string?)null,
+                    prefixCount = prefixes.Count,
+                    type = "list"
+                });
+            }
+        }
+
         return ApiResponse.Ok(result);
     }
 
@@ -548,7 +568,7 @@ public sealed class ManagementApi : IHostedService, IDisposable
                 ? [(community: 0u, route: r)]
                 : r.Communities.Select(c => (community: c, route: r)))
             .GroupBy(x => x.community)
-            .ToDictionary(g => g.Key == 0 ? "default" : CommunityToString(g.Key), g => g.Count());
+            .ToDictionary(g => g.Key == 0 ? "default" : CommunityCodec.Format(g.Key), g => g.Count());
 
         return ApiResponse.Ok(new { total = routes.Count, byCommunity });
     }
@@ -600,19 +620,6 @@ public sealed class ManagementApi : IHostedService, IDisposable
         }
 
         return ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
-    }
-
-    private static uint ParseCommunity(string community)
-    {
-        var colon = community.IndexOf(':');
-        var asn = uint.Parse(community[..colon]);
-        var value = uint.Parse(community[(colon + 1)..]);
-        return (asn << 16) | (value & 0xFFFF);
-    }
-
-    private static string CommunityToString(uint community)
-    {
-        return $"{community >> 16}:{community & 0xFFFF}";
     }
 
     private static async Task WriteResponse(HttpListenerContext ctx, ApiResponse response)

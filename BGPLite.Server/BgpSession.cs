@@ -23,6 +23,7 @@ public sealed class BgpSession : IDisposable
     private readonly IPeerStore? _peerStore;
     private readonly IPrefixService? _prefixService;
     private readonly AppConfig? _appConfig;
+    private readonly IPrefixAggregator _prefixAggregator;
 
     private BgpFsmState _state = BgpFsmState.Idle;
     private uint _remoteAsn;
@@ -31,6 +32,7 @@ public sealed class BgpSession : IDisposable
     private ushort _negotiatedHoldTime;
     private List<IpPrefix> _advertisedPrefixes = [];
     private TimeSpan _keepAliveInterval;
+    private long _lastReceivedTicks; // UTC ticks of last received message; drives the HoldTimer (Interlocked)
 
     public BgpFsmState State => _state;
     public PeerConfig Peer => _peerConfig;
@@ -59,24 +61,25 @@ public sealed class BgpSession : IDisposable
 
     private async Task WithdrawAllAsync()
     {
-        if (_advertisedPrefixes.Count == 0) return;
+        var count = _advertisedPrefixes.Count;
+        if (count == 0) return;
 
         const int maxPerUpdate = 100;
-        for (var i = 0; i < _advertisedPrefixes.Count; i += maxPerUpdate)
+        for (var i = 0; i < count; i += maxPerUpdate)
         {
-            var batch = _advertisedPrefixes.Skip(i).Take(maxPerUpdate).ToList();
+            var batch = _advertisedPrefixes.GetRange(i, Math.Min(maxPerUpdate, count - i));
             var update = new BgpUpdateMessage
             {
                 WithdrawnRoutes = batch,
                 PathAttributes = [],
                 Nlri = []
             };
-            await SendMessageAsync(update);
+            await WriteMessageAsync(update); // caller (initial send / refresh) already holds _sendLock
             _metrics.UpdateSent();
         }
 
-        _logger.LogInformation("Withdrawn {Count} routes from {Peer}", _advertisedPrefixes.Count, _peerConfig.Address);
-        _advertisedPrefixes = [];
+        _logger.LogInformation("Withdrawn {Count} routes from {Peer}", count, _peerConfig.Address);
+        _advertisedPrefixes.Clear();
     }
 
     public BgpSession(
@@ -90,7 +93,8 @@ public sealed class BgpSession : IDisposable
         Action<string, uint>? onPeerIdentified = null,
         IPeerStore? peerStore = null,
         IPrefixService? prefixService = null,
-        AppConfig? appConfig = null)
+        AppConfig? appConfig = null,
+        IPrefixAggregator? prefixAggregator = null)
     {
         _socket = socket;
         _stream = new NetworkStream(socket, ownsSocket: true);
@@ -104,11 +108,12 @@ public sealed class BgpSession : IDisposable
         _peerStore = peerStore;
         _prefixService = prefixService;
         _appConfig = appConfig;
+        _prefixAggregator = prefixAggregator ?? new ExactUnionPrefixAggregator();
     }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
-        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
 
         try
         {
@@ -172,8 +177,18 @@ public sealed class BgpSession : IDisposable
             _metrics.SessionEstablished();
             _logger.LogInformation("SessionEstablished with {Peer} ASN={Asn}", _peerConfig.Address, _remoteAsn);
 
-            // Send initial routes
-            await SendAllRoutesAsync();
+            // Send initial routes. Hold the send lock so _advertisedPrefixes stays consistent
+            // w.r.t. a RefreshRoutesAsync fired from the API the instant IsEstablished became true.
+            await _sendLock.WaitAsync(linkedCts.Token);
+            try
+            {
+                await SendAllRoutesAsync();
+                // End-of-RIB once the initial dump is complete (RFC 4724 §4.1): lets GR-capable
+                // peers finalize stale routes. Tied to session establishment, so NOT sent on refresh.
+                if (_bgpConfig.GracefulRestart)
+                    await SendEndOfRibAsync();
+            }
+            finally { _sendLock.Release(); }
 
             // Run main loop: read messages + send keepalives
             await RunEstablishedAsync(linkedCts.Token);
@@ -181,6 +196,11 @@ public sealed class BgpSession : IDisposable
         catch (OperationCanceledException)
         {
             _logger.LogInformation("SessionClosed (cancelled) with {Peer}", _peerConfig.Address);
+        }
+        catch (BgpNotificationException ex)
+        {
+            _logger.LogWarning(ex, "BGP error from {Peer}: {Error}/{SubError}", _peerConfig.Address, ex.ErrorCode, ex.SubErrorCode);
+            await SendNotificationAsync(ex.ErrorCode, ex.SubErrorCode);
         }
         catch (BgpParseException ex)
         {
@@ -190,6 +210,8 @@ public sealed class BgpSession : IDisposable
         catch (Exception ex)
         {
             _logger.LogError(ex, "Session error with {Peer}", _peerConfig.Address);
+            // Best-effort Cease so the peer sees a clean close instead of a bare TCP RST.
+            try { await SendNotificationAsync(BgpConstants.Error.Cease, BgpConstants.SubError.Unspecific); } catch { }
         }
         finally
         {
@@ -209,16 +231,32 @@ public sealed class BgpSession : IDisposable
 
     private async Task RunEstablishedAsync(CancellationToken cancellationToken)
     {
-        using var keepaliveTimer = new PeriodicTimer(_keepAliveInterval);
+        // Hold time 0 -> KEEPALIVE timer and Hold Timer are disabled (RFC 4271 §4.2/§6.5).
+        if (_negotiatedHoldTime == 0)
+        {
+            await ReadLoopAsync(cancellationToken);
+            await _cts.CancelAsync();
+            return;
+        }
 
+        Interlocked.Exchange(ref _lastReceivedTicks, DateTime.UtcNow.Ticks);
+
+        using var keepaliveTimer = new PeriodicTimer(_keepAliveInterval);
         var readTask = ReadLoopAsync(cancellationToken);
-        var keepaliveTask = KeepAliveLoopAsync(keepaliveTimer, cancellationToken);
+        var keepaliveTask = HoldTimerLoopAsync(keepaliveTimer, cancellationToken);
 
         await Task.WhenAny(readTask, keepaliveTask);
-        _cts.Cancel();
+        await _cts.CancelAsync();
 
-        try { await readTask; } catch { }
-        try { await keepaliveTask; } catch { }
+        await AwaitLoopTaskAsync(readTask, "read");
+        await AwaitLoopTaskAsync(keepaliveTask, "keepalive");
+    }
+
+    private async Task AwaitLoopTaskAsync(Task task, string label)
+    {
+        try { await task; }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _logger.LogWarning(ex, "{Label} loop faulted for {Peer}", label, _peerConfig.Address); }
     }
 
     private async Task ReadLoopAsync(CancellationToken cancellationToken)
@@ -226,6 +264,7 @@ public sealed class BgpSession : IDisposable
         while (!cancellationToken.IsCancellationRequested)
         {
             var message = await ReceiveMessageAsync(cancellationToken);
+            Interlocked.Exchange(ref _lastReceivedTicks, DateTime.UtcNow.Ticks);
 
             switch (message)
             {
@@ -244,10 +283,20 @@ public sealed class BgpSession : IDisposable
         }
     }
 
-    private async Task KeepAliveLoopAsync(PeriodicTimer timer, CancellationToken cancellationToken)
+    private async Task HoldTimerLoopAsync(PeriodicTimer timer, CancellationToken cancellationToken)
     {
+        var holdTime = TimeSpan.FromSeconds(_negotiatedHoldTime);
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
+            // Hold timer: tear down if no message was received within the negotiated hold time (RFC 4271 §6.6).
+            if (DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastReceivedTicks) >= holdTime.Ticks)
+            {
+                _logger.LogWarning("Hold timer expired for {Peer} (no message for {Hold}s)",
+                    _peerConfig.Address, _negotiatedHoldTime);
+                await SendNotificationAsync(BgpConstants.Error.HoldTimerExpired, BgpConstants.SubError.Unspecific);
+                return;
+            }
+
             await SendKeepaliveAsync();
             _logger.LogDebug("KeepAliveSent to {Peer}", _peerConfig.Address);
         }
@@ -278,12 +327,16 @@ public sealed class BgpSession : IDisposable
                 switch (attr.TypeCode)
                 {
                     case BgpConstants.Attribute.Origin:
+                        if (attr.Data.Length < 1)
+                            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed ORIGIN attribute");
                         origin = AttributeHelper.ReadOrigin(attr);
                         break;
                     case BgpConstants.Attribute.AsPath:
                         asPath = AttributeHelper.ReadAsPath(attr, _remoteFourByteAsn);
                         break;
                     case BgpConstants.Attribute.NextHop:
+                        if (attr.Data.Length < 4)
+                            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed NEXT_HOP attribute");
                         nextHop = AttributeHelper.ReadNextHop(attr);
                         break;
                     case BgpConstants.Attribute.Community:
@@ -419,6 +472,36 @@ public sealed class BgpSession : IDisposable
                     }
                 }
 
+                // Prefix-source subscriptions: subscribed names that aren't RIPE ASN/country lists but
+                // match a configured PrefixSource (e.g. "microsoft", "aws"). "ru" is already resolved
+                // as a country list above, so it isn't fetched twice.
+                var resolvedAsRipe = subscribedLists.Select(l => l.Name).ToHashSet();
+                var sourceNames = subscriptionIds
+                    .Where(n => !resolvedAsRipe.Contains(n) && _appConfig!.PrefixSources.Any(s => s.Name == n))
+                    .ToList();
+                foreach (var name in sourceNames)
+                {
+                    try
+                    {
+                        var srcPrefixes = await _prefixService.GetSourcePrefixesAsync(name);
+                        foreach (var (prefix, length) in srcPrefixes)
+                        {
+                            routes.Add(new Route
+                            {
+                                Prefix = prefix,
+                                PrefixLength = length,
+                                NextHop = nextHop
+                            });
+                        }
+                        _logger.LogInformation("Fetched {Count} prefixes from source '{Source}' for {Peer}",
+                            srcPrefixes.Count, name, _peerConfig.Address);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to fetch source '{Source}' for {Peer}", name, _peerConfig.Address);
+                    }
+                }
+
                 // Add custom prefixes (already loaded above)
                 _logger.LogInformation("Peer {Peer} has {SubRoutes} subscription routes + {CustomCount} custom prefixes",
                     _peerConfig.Address, routes.Count, customPrefixes.Count);
@@ -522,23 +605,38 @@ public sealed class BgpSession : IDisposable
             }
         }
 
-        // Final fallback: send from shared route table
-        var tableRoutes = _routeTable.GetAll();
-        if (tableRoutes.Count == 0) return;
+        // Final fallback: send from shared route table (single pass — one allocation, not two)
+        var filtered = new List<Route>();
+        foreach (var r in _routeTable.Enumerate())
+        {
+            if (_routeFilter.AcceptOutgoing(r, _peerConfig))
+                filtered.Add(r);
+        }
+        if (filtered.Count == 0) return;
 
-        var filtered = tableRoutes.Where(r => _routeFilter.AcceptOutgoing(r, _peerConfig)).ToList();
         await SendRoutesAsync(nextHop, filtered);
     }
 
     private async Task SendRoutesAsync(uint nextHop, List<Route> routes)
     {
+        // Summarize before sending: merge adjacent/overlapping prefixes into the minimal
+        // exact set (no extra IPs). Choke point for both initial send and RefreshRoutesAsync,
+        // so _advertisedPrefixes stays consistent with what we later withdraw.
+        var aggregated = _prefixAggregator.Aggregate(routes);
+        if (_logger.IsEnabled(LogLevel.Information) && aggregated.Count != routes.Count)
+            _logger.LogInformation("Aggregated {Before} -> {After} prefixes for {Peer}",
+                routes.Count, aggregated.Count, _peerConfig.Address);
+        routes = aggregated as List<Route> ?? aggregated.ToList();
+
         const int maxNlriPerUpdate = 100;
+        _advertisedPrefixes.EnsureCapacity(_advertisedPrefixes.Count + routes.Count);
         var sent = 0;
         var batch = new List<Route>(maxNlriPerUpdate);
 
         foreach (var route in routes)
         {
             batch.Add(route);
+            _advertisedPrefixes.Add(new IpPrefix(route.Prefix, route.PrefixLength));
             if (batch.Count >= maxNlriPerUpdate)
             {
                 await SendRouteBatchAsync(nextHop, batch);
@@ -553,36 +651,61 @@ public sealed class BgpSession : IDisposable
             sent += batch.Count;
         }
 
-        _advertisedPrefixes.AddRange(routes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)));
         _logger.LogInformation("UpdateSent {Count} routes to {Peer}", sent, _peerConfig.Address);
     }
 
     private async Task SendRouteBatchAsync(uint nextHop, List<Route> routes)
     {
-        // Collect all unique communities from batch
-        var allCommunities = routes
-            .SelectMany(r => r.Communities)
-            .Distinct()
-            .ToArray();
-
-        var attrs = new List<PathAttribute>
+        // The COMMUNITY path attribute applies to EVERY NLRI in an UPDATE, so partition the
+        // batch by community set and emit one UPDATE per set. Otherwise prefixes belonging to
+        // one group would be tagged with another group's communities on the wire.
+        foreach (var groupRoutes in GroupByCommunitySet(routes))
         {
-            AttributeHelper.WriteOrigin(BgpOrigin.Igp),
-            AttributeHelper.WriteAsPath([_bgpConfig.Asn], _localFourByteAsn),
-            AttributeHelper.WriteNextHop(nextHop)
-        };
+            var attrs = new List<PathAttribute>
+            {
+                AttributeHelper.WriteOrigin(BgpOrigin.Igp),
+                AttributeHelper.WriteAsPath([_bgpConfig.Asn], _localFourByteAsn),
+                AttributeHelper.WriteNextHop(nextHop)
+            };
 
-        if (allCommunities.Length > 0)
-            attrs.Add(AttributeHelper.WriteCommunities(allCommunities));
+            var communities = groupRoutes[0].Communities;
+            if (communities.Length > 0)
+                attrs.Add(AttributeHelper.WriteCommunities(communities));
 
-        var update = new BgpUpdateMessage
+            var nlri = groupRoutes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList();
+            await SendUpdateBatchAsync(attrs, nlri);
+        }
+    }
+
+    /// <summary>
+    /// Partitions routes into groups that share an identical community set, so each emitted
+    /// UPDATE carries a single COMMUNITY attribute. Internal for test coverage.
+    /// </summary>
+    internal static List<List<Route>> GroupByCommunitySet(IReadOnlyList<Route> routes) =>
+        routes.GroupBy(r => r.Communities, CommunitySetComparer.Instance)
+              .Select(g => g.ToList())
+              .ToList();
+
+    /// <summary>Sequence equality over a route's community array (set-equivalence within a batch).</summary>
+    private sealed class CommunitySetComparer : IEqualityComparer<uint[]>
+    {
+        public static readonly CommunitySetComparer Instance = new();
+
+        public bool Equals(uint[]? x, uint[]? y)
         {
-            PathAttributes = attrs,
-            Nlri = routes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList()
-        };
+            if (ReferenceEquals(x, y)) return true;
+            if (x is null || y is null || x.Length != y.Length) return false;
+            for (var i = 0; i < x.Length; i++)
+                if (x[i] != y[i]) return false;
+            return true;
+        }
 
-        await SendMessageAsync(update);
-        _metrics.UpdateSent();
+        public int GetHashCode(uint[] obj)
+        {
+            var hc = new HashCode();
+            foreach (var c in obj) hc.Add(c);
+            return hc.ToHashCode();
+        }
     }
 
     private async Task SendUpdateBatchAsync(List<PathAttribute> attrs, List<IpPrefix> nlri)
@@ -593,8 +716,21 @@ public sealed class BgpSession : IDisposable
             Nlri = nlri
         };
 
-        await SendMessageAsync(update);
+        await WriteMessageAsync(update); // caller (initial send / refresh) already holds _sendLock
         _metrics.UpdateSent();
+    }
+
+    /// <summary>
+    /// End-of-RIB marker for IPv4 unicast (RFC 4724 §2): a minimum-length UPDATE (no withdrawn
+    /// routes, no path attributes, no NLRI). Signals completion of the initial routing update so
+    /// GR-capable peers finalize — replacing stale routes with what we re-advertised and purging
+    /// the rest. Caller already holds _sendLock.
+    /// </summary>
+    private async Task SendEndOfRibAsync()
+    {
+        await WriteMessageAsync(new BgpUpdateMessage());
+        _metrics.UpdateSent();
+        _logger.LogDebug("End-of-RIB sent to {Peer}", _peerConfig.Address);
     }
 
     #region Message I/O
@@ -607,8 +743,8 @@ public sealed class BgpSession : IDisposable
             await ReadExactAsync(headerBuffer.AsMemory(0, BgpConstants.MessageHeaderSize), cancellationToken);
 
             var length = BgpMessageReader.GetMessageLength(headerBuffer);
-            if (length < 0)
-                throw new BgpParseException("Incomplete message header");
+            if (length is < BgpConstants.MinMessageSize or > BgpConstants.MaxMessageSize)
+                throw new BgpParseException($"Invalid message length: {length}");
 
             var payloadSize = length - BgpConstants.MessageHeaderSize;
             var messageBuffer = ArrayPool<byte>.Shared.Rent(length);
@@ -633,6 +769,14 @@ public sealed class BgpSession : IDisposable
     }
 
     private async Task SendMessageAsync(BgpMessage message)
+    {
+        await _sendLock.WaitAsync();
+        try { await WriteMessageAsync(message); }
+        finally { _sendLock.Release(); }
+    }
+
+    // Writes one message without acquiring the lock — caller MUST already hold _sendLock.
+    private async Task WriteMessageAsync(BgpMessage message)
     {
         var bufferSize = BgpMessageWriter.GetBufferSize(message);
         var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
@@ -678,6 +822,20 @@ public sealed class BgpSession : IDisposable
         if (remoteOpen.Capabilities.Any(c => c.Code == BgpConstants.Capability.RouteRefresh))
             capabilities.Add(BgpCapabilityInfo.RouteRefresh());
 
+        // Advertise Graceful Restart (RFC 4724) so GR-capable peers retain our routes across our
+        // restart. R=1: every app start is treated as a restart (harmless on first connect, reduces
+        // churn on transient reconnects; proper restart detection would need a persisted generation
+        // counter — future work). F reflects whether forwarding state is preserved and is configurable
+        // (the peer keeps stale routes only while F=1, RFC 4724 §4.2). Restart Time is clamped to
+        // <= HoldTime here and to the 12-bit field max in the codec. Advertised unconditionally when
+        // enabled (RFC 4724 §4 recommends it; non-GR peers safely ignore it per RFC 5492).
+        if (_bgpConfig.GracefulRestart)
+        {
+            var restartTime = (ushort)Math.Min(_bgpConfig.RestartTime, _bgpConfig.HoldTime);
+            capabilities.Add(BgpCapabilityInfo.GracefulRestart(
+                restartState: true, restartTime, forwardingState: _bgpConfig.GracefulRestartForwardingState));
+        }
+
         var asn16 = _bgpConfig.Asn > ushort.MaxValue ? (ushort)23456 : (ushort)_bgpConfig.Asn;
         var routerId = BgpConstants.IPAddressToUint(_bgpConfig.GetRouterIdAddress());
 
@@ -720,6 +878,25 @@ public sealed class BgpSession : IDisposable
         _logger.LogInformation("NotificationSent to {Peer}: {Error}/{SubError}", _peerConfig.Address, errorCode, subErrorCode);
     }
 
+    /// <summary>
+    /// Best-effort Cease NOTIFICATION for graceful shutdown (RFC 4271 §6.2). The caller (BgpServer)
+    /// should only invoke this on an Established session and only when Graceful Restart is disabled —
+    /// a NOTIFICATION termination bypasses GR (RFC 4724 §4), so with GR on we drop the TCP connection
+    /// instead to let peers retain our routes. Write/IO errors are swallowed (we are shutting down).
+    /// </summary>
+    public async Task NotifyCeaseAsync()
+    {
+        try
+        {
+            await SendNotificationAsync(BgpConstants.Error.Cease, BgpConstants.SubError.Unspecific);
+            _logger.LogInformation("Cease sent to {Peer} on shutdown", _peerConfig.Address);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to send Cease to {Peer} on shutdown", _peerConfig.Address);
+        }
+    }
+
     #endregion
 
     #region Validation
@@ -727,7 +904,7 @@ public sealed class BgpSession : IDisposable
     private void ValidateOpen(BgpOpenMessage open)
     {
         if (open.Version != BgpConstants.BgpVersion)
-            throw new BgpParseException($"Unsupported BGP version: {open.Version}");
+            throw new BgpNotificationException(BgpConstants.Error.OpenMessageError, BgpConstants.SubError.UnsupportedVersion, $"Unsupported BGP version: {open.Version}");
 
         _remoteFourByteAsn = CapabilityHelper.GetRemoteAsn(open).HasValue;
         _remoteAsn = CapabilityHelper.GetEffectiveAsn(open);
@@ -735,15 +912,30 @@ public sealed class BgpSession : IDisposable
         _onPeerIdentified?.Invoke(_peerConfig.Address, _remoteAsn);
 
         if (_peerConfig.RemoteAsn.HasValue && _remoteAsn != _peerConfig.RemoteAsn.Value)
-            throw new BgpParseException($"Unexpected ASN: expected {_peerConfig.RemoteAsn}, got {_remoteAsn}");
+            throw new BgpNotificationException(BgpConstants.Error.OpenMessageError, BgpConstants.SubError.BadPeerAs, $"Unexpected ASN: expected {_peerConfig.RemoteAsn}, got {_remoteAsn}");
 
         var holdTime = open.HoldTime;
         if (holdTime != 0 && holdTime < 3)
-            throw new BgpParseException($"Unacceptable hold time: {holdTime}");
+            throw new BgpNotificationException(BgpConstants.Error.OpenMessageError, BgpConstants.SubError.UnacceptableHoldTime, $"Unacceptable hold time: {holdTime}");
+
+        // BGP Identifier must be non-zero and must not collide with our own (RFC 4271 §6.2).
+        if (open.RouterId == 0)
+            throw new BgpNotificationException(BgpConstants.Error.OpenMessageError, BgpConstants.SubError.BadBgpIdentifier, "Invalid BGP identifier: 0.0.0.0");
+
+        var localRouterId = BgpConstants.IPAddressToUint(_bgpConfig.GetRouterIdAddress());
+        if (open.RouterId == localRouterId)
+            throw new BgpNotificationException(BgpConstants.Error.OpenMessageError, BgpConstants.SubError.BadBgpIdentifier, "BGP identifier collision with local RouterId");
+
+        var peerGr = CapabilityHelper.GetGracefulRestart(open);
+        _logger.LogInformation("Peer {Peer} Graceful Restart: {State}",
+            _peerConfig.Address,
+            peerGr.HasValue
+                ? $"supported (restartState={peerGr.Value.RestartState}, restartTime={peerGr.Value.RestartTime}s, IPv4/Unicast forwarding={peerGr.Value.Ipv4UnicastForwarding})"
+                : "not supported");
 
         _negotiatedHoldTime = holdTime;
         _keepAliveInterval = holdTime == 0
-            ? TimeSpan.FromSeconds(_bgpConfig.KeepAlive)
+            ? TimeSpan.Zero
             : TimeSpan.FromSeconds(Math.Max(holdTime / 3, 1));
     }
 

@@ -1,8 +1,8 @@
 # BGPLite — План исправлений
 
-## Приоритет 1: Критические ошибки сессий и потокобезопасность
+## Приоритет 1: Критические ошибки сессий и потокобезопасность ✅ выполнено (PR #5)
 
-### 1.1 Гонка при замене сессий
+### 1.1 Гонка при замене сессий ✅
 **Файл:** `BgpServer.cs:122,142`
 **Проблема:** `_sessions[peerAddress] = session` безусловно перезаписывает запись. Finally-блок старой сессии удалит новую.
 **Исправление:**
@@ -10,7 +10,7 @@
 - При обнаружении существующей сессии — отправить NOTIFICATION/Cease старой, дождаться завершения, затем создать новую
 - Или: в `RunSessionAsync` проверять `_sessions[peerAddress] == this` перед `TryRemove`
 
-### 1.2 Параллельная запись в `_stream`
+### 1.2 Параллельная запись в `_stream` ✅
 **Файл:** `BgpSession.cs:208`
 **Проблема:** `_sendLock` берётся только в `RefreshRoutesAsync`. Keepalive, initial routes, NOTIFICATION пишут без блокировки. `NetworkStream` не потокобезопасен.
 **Исправление:**
@@ -18,7 +18,7 @@
 - Или: ввести `Channel<BgpMessage>` + единственный writer-loop
 - Все пути отправки должны проходить через одну точку синхронизации
 
-### 1.3 Отсутствует Hold Timer
+### 1.3 Отсутствует Hold Timer ✅
 **Файл:** `BgpSession.cs`, `BgpTimers.cs` (мёртвый код)
 **Проблема:** RFC 4271 требует NOTIFICATION (Hold Timer Expired, subcode 4) + Idle при истечении hold-таймера. `_negotiatedHoldTime` не используется.
 **Исправление:**
@@ -27,14 +27,14 @@
 - По истечении: `SendNotificationAsync(4, 0)` → `_cts.Cancel()` → FSM → Idle
 - Удалить мёртвый код `BgpTimers.cs`, реализовать логику
 
-### 1.4 NOTIFICATION при штатном завершении
+### 1.4 NOTIFICATION при штатном завершении ✅
 **Файл:** `BgpSession.cs:190-193`
 **Проблема:** Внешний `catch (Exception)` не отправляет NOTIFICATION (Cease). RFC 4271 §8.1.
 **Исправление:**
 - В `catch (Exception)` и в `finally`: попытаться `SendNotificationAsync(6, 0)`, поглотить IO-ошибки
 - Гарантировать NOTIFICATION перед `socket.Close()`
 
-### 1.5 `_state` без барьеров памяти
+### 1.5 `_state` без барьеров памяти ✅
 **Файл:** `BgpSession.cs:37,752`
 **Проблема:** `IsEstablished` читает `_state` из другого потока без `Volatile.Read`. JIT может кешировать.
 **Исправление:**

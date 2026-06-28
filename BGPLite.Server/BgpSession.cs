@@ -957,6 +957,14 @@ public sealed class BgpSession : IDisposable
     /// </summary>
     public async Task NotifyCeaseAsync()
     {
+        // Atomically claim the teardown as LocalCease BEFORE sending. If a concurrent
+        // MarkSilentClose (GR-aware shutdown / session replacement) or a peer NOTIFICATION
+        // or hold timer expiry already latched a reason, the CAS fails and we send nothing —
+        // preserving the silent close (RFC 4724 §4), no-reply (RFC 4271 §6.3), and
+        // exactly-one-NOTIFICATION (§8.1).
+        if (Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.LocalCease, (int)TeardownReason.None) != (int)TeardownReason.None)
+            return;
+
         try
         {
             await SendNotificationAsync(BgpConstants.Error.Cease, BgpConstants.SubError.Unspecific);
@@ -966,12 +974,6 @@ public sealed class BgpSession : IDisposable
         {
             _logger.LogDebug(ex, "Failed to send Cease to {Peer} on shutdown", _peerConfig.Address);
         }
-        // Latch BEFORE returning so the session's RunAsync finally-block (which runs on
-        // a different thread once the cancellation we triggered fires) does not emit a
-        // second Cease (RFC 4271 §8.1: exactly one NOTIFICATION per teardown). CAS from None:
-        // if a concurrent teardown already latched a reason (e.g. peer NOTIFICATION, hold timer),
-        // respect it and don't mask it.
-        Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.LocalCease, (int)TeardownReason.None);
     }
 
     /// <summary>

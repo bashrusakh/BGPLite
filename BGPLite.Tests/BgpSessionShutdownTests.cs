@@ -87,6 +87,46 @@ public class BgpSessionShutdownTests
     }
 
     /// <summary>
+    /// Regression: NotifyCeaseAsync must NOT send a Cease when MarkSilentClose was already called.
+    /// The old code sent Cease on the wire BEFORE CAS-latching LocalCease, so a concurrent
+    /// MarkSilentClose (GR-aware shutdown / session replacement) that already latched SilentClose
+    /// would still see the Cease go out — violating RFC 4724 §4 (silent close = no NOTIFICATION)
+    /// and RFC 4271 §8.1 (exactly one NOTIFICATION per teardown). The fix moves the CAS before
+    /// SendNotificationAsync and returns early when the reason is no longer None.
+    /// </summary>
+    [Fact]
+    public async Task NotifyCeaseAsync_Does_Not_Send_When_SilentClose_Already_Latched()
+    {
+        var (server, client) = ConnectedPair();
+        using var clientSock = client;
+        var bgpConfig = new BgpConfig { Asn = 65001, RouterId = "127.0.0.1", HoldTime = 0, KeepAlive = 0 };
+        using var session = new BgpSession(
+            server,
+            new PeerConfig { Address = "127.0.0.1" },
+            bgpConfig,
+            new RouteTable(),
+            AllowAllFilter.Instance,
+            new BgpMetrics(),
+            new NopLogger<BgpSession>());
+
+        var runTask = await EstablishSessionAsync(session, client, bgpConfig);
+
+        // MarkSilentClose latches SilentClose and cancels CTS — RunAsync will unwind.
+        session.MarkSilentClose();
+
+        // Wait for RunAsync to complete so the session is fully torn down.
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(session.IsEstablished, "session must leave Established after MarkSilentClose");
+
+        // NotifyCeaseAsync must see SilentClose already latched and return without sending.
+        await session.NotifyCeaseAsync();
+
+        // Drain the wire: no NOTIFICATION should appear (silent close).
+        var sent = await DrainAsync(client, TimeSpan.FromSeconds(2));
+        Assert.DoesNotContain(sent, m => m is BgpNotificationMessage);
+    }
+
+    /// <summary>
     /// RFC 4271 §6.6 / §8.1: when the negotiated hold timer expires (no message received within
     /// HoldTime seconds), the session MUST emit NOTIFICATION(Hold Timer Expired, subcode=0) and
     /// transition to Idle. Drives the OPEN/OpenConfirm exchange with HoldTime=3, then goes silent

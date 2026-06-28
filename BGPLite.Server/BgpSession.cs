@@ -28,12 +28,18 @@ public sealed class BgpSession : IDisposable
     // volatile: read by external threads (BgpServer.RefreshPeerAsync/StopAsync). Guarantees
     // acquire/release so IsEstablished reflects the most recent TransitionTo without JIT caching.
     private volatile BgpFsmState _state = BgpFsmState.Idle;
-    // Latched once a Cease NOTIFICATION has been emitted so the finally-block best-effort
-    // Cease (RFC 4271 §8.1) doesn't double-send after catch (Exception) already sent one.
-    // int + Interlocked.Exchange: written by RunAsync AND by external callers
-    // (NotifyCeaseAsync from BgpServer.StopAsync / session-replace path), read by the
-    // RunAsync finally-block on a different thread.
-    private int _ceaseSentOnTeardown;
+    // Split teardown reasons (RFC 4271 §8.1 mandates exactly one NOTIFICATION per teardown).
+    // The finally-block only emits a best-effort Cease when the reason is still None (i.e. an
+    // unexpected close from Established). All other reasons already produced — or deliberately
+    // suppressed — a NOTIFICATION, so replying with Cease would be a protocol violation:
+    //   - LocalCease:        we sent Cease (catch blocks, NotifyCeaseAsync) → no reply
+    //   - RemoteNotification: peer sent NOTIFICATION → release resources/Idle, do NOT reply
+    //   - HoldTimerExpired:  we sent Hold Timer Expired → no reply
+    //   - SilentClose:       Graceful-Restart-aware shutdown / session replacement drops the TCP
+    //                        connection silently so peers retain routes (RFC 4724 §4) → no reply
+    // int + Interlocked.Exchange: written by RunAsync AND by external callers (BgpServer
+    // StopAsync/replace path), read by the RunAsync finally-block on a different thread.
+    private int _teardownReason = (int)TeardownReason.None;
     private uint _remoteAsn;
     private bool _remoteFourByteAsn;
     private bool _localFourByteAsn = true;
@@ -214,57 +220,51 @@ public sealed class BgpSession : IDisposable
         catch (BgpNotificationException ex)
         {
             _logger.LogWarning(ex, "BGP error from {Peer}: {Error}/{SubError}", _peerConfig.Address, ex.ErrorCode, ex.SubErrorCode);
-            try
+            // Atomically claim the teardown as LocalCease BEFORE sending. If a concurrent
+            // MarkSilentClose (GR-aware shutdown / session replacement) or a peer NOTIFICATION
+            // already latched a reason, the CAS fails and we send nothing — preserving the silent
+            // close (RFC 4724 §4) / no-reply (RFC 4271 §6.3) and exactly-one-NOTIFICATION (§8.1).
+            if (Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.LocalCease, (int)TeardownReason.None) == (int)TeardownReason.None)
             {
-                await SendNotificationAsync(ex.ErrorCode, ex.SubErrorCode);
-            }
-            catch { /* best-effort */ }
-            finally
-            {
-                // Latch regardless of success: even a partial write means the peer saw bytes,
-                // and a second NOTIFICATION would violate RFC 4271 §8.1.
-                Interlocked.Exchange(ref _ceaseSentOnTeardown, 1);
+                try { await SendNotificationAsync(ex.ErrorCode, ex.SubErrorCode); }
+                catch { /* best-effort */ }
             }
         }
         catch (BgpParseException ex)
         {
             _logger.LogError(ex, "Parse error from {Peer}", _peerConfig.Address);
-            try
+            if (Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.LocalCease, (int)TeardownReason.None) == (int)TeardownReason.None)
             {
-                await SendNotificationAsync(BgpConstants.Error.MessageHeaderError, BgpConstants.SubError.Unspecific);
-            }
-            catch { /* best-effort */ }
-            finally
-            {
-                Interlocked.Exchange(ref _ceaseSentOnTeardown, 1);
+                try { await SendNotificationAsync(BgpConstants.Error.MessageHeaderError, BgpConstants.SubError.Unspecific); }
+                catch { /* best-effort */ }
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Session error with {Peer}", _peerConfig.Address);
             // Best-effort Cease so the peer sees a clean close instead of a bare TCP RST.
-            // Latch _ceaseSentOnTeardown so the finally-block doesn't double-send Cease.
-            try
+            // CAS from None: if a concurrent silent close / peer NOTIFICATION already claimed the
+            // teardown, do NOT emit a NOTIFICATION (RFC 4724 §4 / RFC 4271 §6.3 / §8.1).
+            if (Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.LocalCease, (int)TeardownReason.None) == (int)TeardownReason.None)
             {
-                await SendNotificationAsync(BgpConstants.Error.Cease, BgpConstants.SubError.Unspecific);
-            }
-            catch { /* best-effort */ }
-            finally
-            {
-                Interlocked.Exchange(ref _ceaseSentOnTeardown, 1);
+                try { await SendNotificationAsync(BgpConstants.Error.Cease, BgpConstants.SubError.Unspecific); }
+                catch { /* best-effort */ }
             }
         }
         finally
         {
             var wasEstablished = _state == BgpFsmState.Established;
-            // RFC 4271 §8.1: graceful termination from Established MUST send Cease before close.
-            // Idempotent guard prevents a double Cease if catch (Exception) above already sent one
-            // or if an external caller (BgpServer.NotifyCeaseAsync on shutdown) already sent Cease.
-            if (wasEstablished && Interlocked.CompareExchange(ref _ceaseSentOnTeardown, 0, 0) == 0)
+            // RFC 4271 §8.1: graceful termination from Established MUST send Cease before close — but
+            // only when no NOTIFICATION was already emitted and the close isn't a deliberate silent
+            // close (GR-aware shutdown / session replacement, RFC 4724 §4) or a peer-initiated
+            // NOTIFICATION (RFC 4271 §6.3: release resources/Idle, do NOT reply). The CAS both tests
+            // AND atomically transitions None→LocalCease, so a concurrent MarkSilentClose that wins
+            // the race suppresses this Cease (no read-then-write window as the prior CompareExchange
+            // (...,0,0) + Exchange had).
+            if (wasEstablished && Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.LocalCease, (int)TeardownReason.None) == (int)TeardownReason.None)
             {
                 try { await SendNotificationAsync(BgpConstants.Error.Cease, BgpConstants.SubError.Unspecific); }
                 catch { /* best-effort */ }
-                Interlocked.Exchange(ref _ceaseSentOnTeardown, 1);
             }
             TransitionTo(BgpFsmState.Idle);
             if (wasEstablished)
@@ -331,6 +331,12 @@ public sealed class BgpSession : IDisposable
                 case BgpNotificationMessage notif:
                     _logger.LogWarning("NotificationReceived from {Peer}: {Error}/{SubError}",
                         _peerConfig.Address, notif.ErrorCode, notif.SubErrorCode);
+                    // RFC 4271 §6.3/§8.1: on receiving a NOTIFICATION, release resources, drop the
+                    // TCP connection and move to Idle. Do NOT send a NOTIFICATION back. Latch the
+                    // teardown reason (CAS from None — a concurrent silent close/hold-expiry wins
+                    // either way, both suppress the finally-block Cease) so the RunAsync finally-block
+                    // does not reply with a Cease.
+                    Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.RemoteNotification, (int)TeardownReason.None);
                     return;
             }
         }
@@ -342,15 +348,20 @@ public sealed class BgpSession : IDisposable
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
             // Hold timer: tear down if no message was received within the negotiated hold time
-            // (RFC 4271 §6.6). After NOTIFICATION(Hold Timer Expired) the FSM moves to Idle and the
-            // session is closed; we mark the teardown guard so the RunAsync finally-block does not
-            // double-emit Cease (RFC 4271 §8.1 mandates exactly one NOTIFICATION per teardown).
+            // (RFC 4271 §6.6). Atomically claim the teardown as HoldTimerExpired BEFORE sending; if a
+            // concurrent MarkSilentClose / peer NOTIFICATION already claimed it, send nothing. The
+            // latch in a finally (matching the catch-block pattern) means a partial/failed write still
+            // counts as the one NOTIFICATION for this teardown (RFC 4271 §8.1), so the finally-block
+            // never double-emits a Cease.
             if (DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastReceivedTicks) >= holdTime.Ticks)
             {
                 _logger.LogWarning("Hold timer expired for {Peer} (no message for {Hold}s)",
                     _peerConfig.Address, _negotiatedHoldTime);
-                Interlocked.Exchange(ref _ceaseSentOnTeardown, 1);
-                await SendNotificationAsync(BgpConstants.Error.HoldTimerExpired, BgpConstants.SubError.Unspecific);
+                if (Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.HoldTimerExpired, (int)TeardownReason.None) == (int)TeardownReason.None)
+                {
+                    try { await SendNotificationAsync(BgpConstants.Error.HoldTimerExpired, BgpConstants.SubError.Unspecific); }
+                    catch { /* best-effort — partial write counts, see RFC 4271 §8.1 */ }
+                }
                 return;
             }
 
@@ -957,8 +968,31 @@ public sealed class BgpSession : IDisposable
         }
         // Latch BEFORE returning so the session's RunAsync finally-block (which runs on
         // a different thread once the cancellation we triggered fires) does not emit a
-        // second Cease (RFC 4271 §8.1: exactly one NOTIFICATION per teardown).
-        Interlocked.Exchange(ref _ceaseSentOnTeardown, 1);
+        // second Cease (RFC 4271 §8.1: exactly one NOTIFICATION per teardown). CAS from None:
+        // if a concurrent teardown already latched a reason (e.g. peer NOTIFICATION, hold timer),
+        // respect it and don't mask it.
+        Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.LocalCease, (int)TeardownReason.None);
+    }
+
+    /// <summary>
+    /// Marks this session for a silent teardown (no NOTIFICATION). Used by Graceful-Restart-aware
+    /// shutdown (RFC 4724 §4) and by session replacement: a NOTIFICATION termination would bypass GR,
+    /// so the TCP connection is dropped silently so peers retain routes across the restart. Also
+    /// cancels the session's own CTS so the read/keepalive loops stop promptly instead of lingering
+    /// until the peer closes the socket or the hold timer fires. Must be called BEFORE the session
+    /// is removed/replaced; the RunAsync finally-block observes the latched reason and emits nothing.
+    /// </summary>
+    public void MarkSilentClose()
+    {
+        // Only latch SilentClose if no reason was latched yet. If a catch block already sent a
+        // Cease (LocalCease) or the peer already sent a NOTIFICATION (RemoteNotification), respect
+        // that reason — the session is already tearing down for it. Overwriting it would mask the
+        // real cause and, combined with the finally-block CAS, could let a second NOTIFICATION slip
+        // through. The CTS cancel is ALWAYS issued (we must unwind the loops regardless of reason).
+        Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.SilentClose, (int)TeardownReason.None);
+        try { _cts.Cancel(); }
+        catch (ObjectDisposedException) { /* already disposed — fine */ }
+        _logger.LogInformation("Session {Peer} marked for silent close", _peerConfig.Address);
     }
 
     #endregion
@@ -1020,4 +1054,25 @@ public sealed class BgpSession : IDisposable
         _sendLock.Dispose();
         _advertisedPrefixesLock.Dispose();
     }
+}
+
+/// <summary>
+/// Why a session is tearing down. Drives whether the RunAsync finally-block emits a best-effort
+/// Cease (RFC 4271 §8.1: exactly one NOTIFICATION per teardown). Only <see cref="None"/> (an
+/// unexpected close from Established) triggers a Cease from the finally; every other reason has
+/// either already produced a NOTIFICATION or is a deliberate silent close (GR/replace).
+/// </summary>
+internal enum TeardownReason
+{
+    /// <summary>No teardown reason latched yet — the finally may send a Cease from Established.</summary>
+    None = 0,
+    /// <summary>We emitted a Cease (catch block or NotifyCeaseAsync) — do not double-send.</summary>
+    LocalCease,
+    /// <summary>Peer sent a NOTIFICATION — release resources/Idle, do NOT reply (RFC 4271 §6.3/§8.1).</summary>
+    RemoteNotification,
+    /// <summary>We emitted Hold Timer Expired — do not double-send.</summary>
+    HoldTimerExpired,
+    /// <summary>Silent close: Graceful-Restart-aware shutdown or session replacement drops the TCP
+    /// connection so peers retain routes (RFC 4724 §4) — emit no NOTIFICATION.</summary>
+    SilentClose,
 }

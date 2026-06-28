@@ -81,8 +81,16 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
         // send a Cease only when GR is disabled — peers then tear down cleanly instead of waiting on
         // the hold timer. With GR enabled we deliberately just drop the TCP connection so peers
         // engage GR and retain our routes across the restart. Must run BEFORE _cts.Cancel() tears
-        // the sessions down.
-        if (!_config.Bgp.GracefulRestart)
+        // the sessions down: the sessions' RunAsync finally-blocks would otherwise see no teardown
+        // reason (None) and emit a best-effort Cease — which would bypass GR exactly as a Cease would.
+        // MarkSilentClose latches SilentClose and cancels each session's own CTS so the read/keepalive
+        // loops stop promptly, then _cts.Cancel() handles the accept loop and anything still pending.
+        if (_config.Bgp.GracefulRestart)
+        {
+            foreach (var session in _sessions.Values)
+                session.MarkSilentClose();
+        }
+        else
         {
             var ceases = _sessions.Values
                 .Where(s => s.IsEstablished)
@@ -140,20 +148,23 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 
                 // TryAdd first so a racing replacement from the same peer doesn't get clobbered
                 // (an older session's finally still owns the key). If an existing session is present
-                // it is the older one — ask it to gracefully terminate via NOTIFICATION/Cease so the
-                // peer sees a clean close instead of a bare TCP RST, then swap. max-active is not
-                // enforced at accept in this codebase, so the simple swap is safe.
+                // it is the older one — silently close it and swap. max-active is not enforced at
+                // accept in this codebase, so the simple swap is safe.
+                //
+                // Replacement policy: the old session must actually stop, not just be told to Cease.
+                // The previous fire-and-forget NotifyCeaseAsync only latched the Cease and wrote bytes;
+                // it never cancelled the old session's CTS, so the read/keepalive loops kept running
+                // until the peer closed the socket or the hold timer fired. MarkSilentClose latches
+                // SilentClose (so the old RunAsync finally emits no NOTIFICATION — RFC 4724 §4 / §8.1)
+                // AND cancels the old CTS so the loops unwind promptly. We do NOT send a Cease on
+                // replacement: the peer is reconnecting right now and a Cease to the old socket is
+                // noise (and, with GR enabled, would bypass GR). The peer sees a TCP close instead.
                 if (!_sessions.TryAdd(peerAddress, session))
                 {
                     if (_sessions.TryGetValue(peerAddress, out var existing))
                     {
                         _logger.LogInformation("Replacing existing session for {Peer}", peerAddress);
-                        // Fire-and-forget: send Cease so the peer sees a clean close. NotifyCeaseAsync
-                        // latches _ceaseSentOnTeardown so the old session's RunAsync finally-block
-                        // does not emit a second Cease (RFC 4271 §8.1). The old session still
-                        // exits when the peer closes the socket or its hold timer fires; we do
-                        // not cancel its CTS here to keep P1 scope minimal.
-                        _ = existing.NotifyCeaseAsync();
+                        existing.MarkSilentClose();
                         _sessions[peerAddress] = session;
                     }
                     else
@@ -181,15 +192,33 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
         }
         finally
         {
-            // Only remove if we are still the registered session. Without this guard, a racing
-            // re-accept for the same peer would install a new session, and our finally would
-            // then erase it from the dictionary.
-            if (_sessions.TryGetValue(peerAddress, out var current) && ReferenceEquals(current, session))
-            {
-                _sessions.TryRemove(peerAddress, out _);
-            }
+            // Atomically remove our registration ONLY if we are still the current session for this
+            // peer. The previous TryGetValue + TryRemove was not atomic: a racing re-accept could
+            // install a newer session between those two calls, and our TryRemove would then erase
+            // the newer session from the dictionary. ConcurrentDictionary has no public
+            // TryRemove(key, expectedValue), but its explicit ICollection<KeyValuePair<TKey,TValue>>
+            // implementation removes the pair only when both key AND value match — an atomic
+            // compare-and-remove. So a newer session installed after our exit is left untouched.
+            RemoveSessionIfOwner(peerAddress, session);
             session.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Atomically removes <paramref name="session"/> from <see cref="_sessions"/> only if it is
+    /// still the registered session for <paramref name="peerAddress"/>. Uses the explicit
+    /// <see cref="ICollection{T}"/>.Remove on ConcurrentDictionary, which is documented to remove
+    /// the pair only when both key and value match — a compare-and-remove that closes the race the
+    /// earlier TryGetValue+TryRemove had (a newer re-accepted session would otherwise be erased).
+    /// </summary>
+    private void RemoveSessionIfOwner(string peerAddress, BgpSession session)
+    {
+        var removed = ((ICollection<KeyValuePair<string, BgpSession>>)_sessions)
+            .Remove(new KeyValuePair<string, BgpSession>(peerAddress, session));
+        if (removed)
+            _logger.LogDebug("Removed session for {Peer} (we owned it)", peerAddress);
+        else
+            _logger.LogDebug("Did not remove session for {Peer} (replaced by a newer session)", peerAddress);
     }
 
     private async Task LogStatusLoopAsync(CancellationToken cancellationToken)

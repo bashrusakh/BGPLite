@@ -40,6 +40,7 @@ public sealed class BgpSession : IDisposable
     // int + Interlocked.Exchange: written by RunAsync AND by external callers (BgpServer
     // StopAsync/replace path), read by the RunAsync finally-block on a different thread.
     private int _teardownReason = (int)TeardownReason.None;
+    private int _disposed;
     private uint _remoteAsn;
     private bool _remoteFourByteAsn;
     private bool _localFourByteAsn = true;
@@ -841,7 +842,15 @@ public sealed class BgpSession : IDisposable
     // acquire _sendLock themselves — every send path goes through here.
     private async Task SendMessageAsync(BgpMessage message)
     {
-        await _sendLock.WaitAsync();
+        try
+        {
+            await _sendLock.WaitAsync();
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
         try
         {
             var bufferSize = BgpMessageWriter.GetBufferSize(message);
@@ -851,6 +860,10 @@ public sealed class BgpSession : IDisposable
                 var written = BgpMessageWriter.WriteMessage(message, buffer);
                 await _stream.WriteAsync(buffer.AsMemory(0, written));
             }
+            catch (ObjectDisposedException)
+            {
+                // Session disposed mid-send — best effort during teardown.
+            }
             finally
             {
                 ArrayPool<byte>.Shared.Return(buffer);
@@ -858,7 +871,8 @@ public sealed class BgpSession : IDisposable
         }
         finally
         {
-            _sendLock.Release();
+            try { _sendLock.Release(); }
+            catch (ObjectDisposedException) { }
         }
     }
 
@@ -1049,6 +1063,9 @@ public sealed class BgpSession : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
         _cts.Cancel();
         _stream.Dispose();
         _socket.Dispose();

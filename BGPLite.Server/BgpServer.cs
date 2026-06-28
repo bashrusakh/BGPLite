@@ -23,6 +23,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     private readonly IPrefixAggregator _prefixAggregator;
     private readonly ConcurrentDictionary<string, BgpSession> _sessions = new();
     private readonly CancellationTokenSource _cts = new();
+    private int _acceptingConnections = 1;
     private Socket? _listener;
     private Task? _acceptTask;
     private PeriodicTimer? _statusTimer;
@@ -77,6 +78,22 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
     {
         _logger.LogInformation("BGP server shutting down");
 
+        // Stop accepting new connections before we snapshot/mark the current sessions.
+        // Otherwise a connection that sneaks in between the GR mark loop and _cts.Cancel()
+        // can miss SilentClose and later emit a protocol-incorrect Cease.
+        Volatile.Write(ref _acceptingConnections, 0);
+
+        if (_listener is not null)
+        {
+            _listener.Close();
+        }
+
+        if (_acceptTask is not null)
+        {
+            try { await _acceptTask; }
+            catch { }
+        }
+
         // Graceful Restart-aware shutdown (RFC 4724 §4): a NOTIFICATION termination bypasses GR, so
         // send a Cease only when GR is disabled — peers then tear down cleanly instead of waiting on
         // the hold timer. With GR enabled we deliberately just drop the TCP connection so peers
@@ -102,22 +119,11 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 
         _cts.Cancel();
 
-        if (_listener is not null)
-        {
-            _listener.Close();
-            _listener = null;
-        }
-
         foreach (var session in _sessions.Values)
         {
             session.Dispose();
         }
         _sessions.Clear();
-
-        if (_acceptTask is not null)
-        {
-            try { await _acceptTask; } catch { }
-        }
 
         _statusTimer?.Dispose();
         if (_statusTask is not null)
@@ -146,6 +152,12 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                     _onPeerIdentified,
                     _peerStore, _prefixService, _config, _prefixAggregator);
 
+                if (Volatile.Read(ref _acceptingConnections) == 0)
+                {
+                    session.Dispose();
+                    break;
+                }
+
                 // TryAdd first so a racing replacement from the same peer doesn't get clobbered
                 // (an older session's finally still owns the key). If an existing session is present
                 // it is the older one — silently close it and swap. max-active is not enforced at
@@ -163,9 +175,10 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                 // Use TryUpdate (atomic CAS) for the replacement so two concurrent accept threads
                 // for the same peer cannot both pass TryGetValue and both install their session.
                 // If the CAS fails, another thread already swapped the entry — retry from the top.
-                if (!_sessions.TryAdd(peerAddress, session))
+                var sessionRegistered = _sessions.TryAdd(peerAddress, session);
+                if (!sessionRegistered)
                 {
-                    while (true)
+                    while (!cancellationToken.IsCancellationRequested && Volatile.Read(ref _acceptingConnections) != 0)
                     {
                         if (_sessions.TryGetValue(peerAddress, out var existing))
                         {
@@ -179,6 +192,7 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                             {
                                 _logger.LogInformation("Replacing existing session for {Peer}", peerAddress);
                                 existing.MarkSilentClose();
+                                sessionRegistered = true;
                                 break;
                             }
                             // CAS failed — another thread replaced it; loop and retry.
@@ -187,17 +201,29 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                         {
                             // Existing was concurrently removed — try to add ours.
                             if (_sessions.TryAdd(peerAddress, session))
+                            {
+                                sessionRegistered = true;
                                 break;
+                            }
                             // TryAdd failed — another thread re-added for this peer; loop and retry.
                         }
                     }
+
+                    if (!sessionRegistered)
+                    {
+                        session.Dispose();
+                        break;
+                    }
                 }
 
-                _ = RunSessionAsync(peerAddress, session, cancellationToken);
+                if (sessionRegistered)
+                    _ = RunSessionAsync(peerAddress, session, cancellationToken);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
+                if (Volatile.Read(ref _acceptingConnections) == 0)
+                    break;
                 _logger.LogError(ex, "Error accepting connection");
             }
         }
@@ -272,9 +298,9 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
 
     public void Dispose()
     {
+        Volatile.Write(ref _acceptingConnections, 0);
+        _listener?.Close();
         _cts.Cancel();
-        _cts.Dispose();
-        _listener?.Dispose();
         foreach (var session in _sessions.Values)
             session.Dispose();
     }

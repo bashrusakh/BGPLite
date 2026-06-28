@@ -166,15 +166,16 @@ public class BgpSessionShutdownTests
 
         // 2) Read session's OPEN + KEEPALIVE (OpenSent → KEEPALIVE → OpenConfirm).
         // The session sends OPEN then a KEEPALIVE — read both.
+        using var hsCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var header = new byte[BgpConstants.MessageHeaderSize];
-        ReadExact(client, header, 0, BgpConstants.MessageHeaderSize);
+        await ReadExactAsync(client, header, hsCts.Token);
         var openLenFromWire = BgpMessageReader.GetMessageLength(header);
         Assert.Equal(BgpMessageType.Open, (BgpMessageType)header[18]);
         var openPayload = new byte[openLenFromWire - BgpConstants.MessageHeaderSize];
-        ReadExact(client, openPayload, 0, openPayload.Length);
+        await ReadExactAsync(client, openPayload, hsCts.Token);
 
         // KEEPALIVE (19 bytes)
-        ReadExact(client, header, 0, BgpConstants.MessageHeaderSize);
+        await ReadExactAsync(client, header, hsCts.Token);
         Assert.Equal(BgpMessageType.Keepalive, (BgpMessageType)header[18]);
 
         // 3) Send KEEPALIVE → Established. Then send no more traffic; hold timer should expire.
@@ -194,6 +195,7 @@ public class BgpSessionShutdownTests
             try { await ReadExactAsync(client, drainHeader, notifCts.Token); }
             catch (OperationCanceledException) { break; }
             catch (IOException) { break; } // socket closed by peer after NOTIFICATION — normal EOF
+            catch (SocketException) { break; } // TCP RST or socket error — treat as EOF
 
             var totalLen = BgpMessageReader.GetMessageLength(drainHeader);
             var payload = new byte[totalLen - BgpConstants.MessageHeaderSize];
@@ -202,6 +204,7 @@ public class BgpSessionShutdownTests
                 try { await ReadExactAsync(client, payload, notifCts.Token); }
                 catch (OperationCanceledException) { break; }
                 catch (IOException) { break; } // socket closed mid-payload — normal EOF
+                catch (SocketException) { break; } // TCP RST or socket error — treat as EOF
             }
             var msg = BgpMessageReader.ReadMessage(Concat(drainHeader, payload));
             if (msg is BgpNotificationMessage n)
@@ -286,6 +289,7 @@ public class BgpSessionShutdownTests
             try { await ReadExactAsync(client, header, cts.Token); }
             catch (OperationCanceledException) { break; }
             catch (IOException) { break; } // socket closed — normal EOF after teardown
+            catch (SocketException) { break; } // TCP RST or socket error — treat as EOF
 
             var totalLen = BgpMessageReader.GetMessageLength(header);
             var payload = new byte[totalLen - BgpConstants.MessageHeaderSize];
@@ -294,6 +298,7 @@ public class BgpSessionShutdownTests
                 try { await ReadExactAsync(client, payload, cts.Token); }
                 catch (OperationCanceledException) { break; }
                 catch (IOException) { break; }
+                catch (SocketException) { break; }
             }
             msgs.Add(BgpMessageReader.ReadMessage(Concat(header, payload)));
         }

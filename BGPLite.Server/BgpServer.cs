@@ -159,18 +159,37 @@ public sealed class BgpServer : IHostedService, ISessionManager, IDisposable
                 // AND cancels the old CTS so the loops unwind promptly. We do NOT send a Cease on
                 // replacement: the peer is reconnecting right now and a Cease to the old socket is
                 // noise (and, with GR enabled, would bypass GR). The peer sees a TCP close instead.
+                //
+                // Use TryUpdate (atomic CAS) for the replacement so two concurrent accept threads
+                // for the same peer cannot both pass TryGetValue and both install their session.
+                // If the CAS fails, another thread already swapped the entry — retry from the top.
                 if (!_sessions.TryAdd(peerAddress, session))
                 {
-                    if (_sessions.TryGetValue(peerAddress, out var existing))
+                    while (true)
                     {
-                        _logger.LogInformation("Replacing existing session for {Peer}", peerAddress);
-                        existing.MarkSilentClose();
-                        _sessions[peerAddress] = session;
-                    }
-                    else
-                    {
-                        // Existing was concurrently removed — just install ours.
-                        _sessions[peerAddress] = session;
+                        if (_sessions.TryGetValue(peerAddress, out var existing))
+                        {
+                            // Atomic CAS: only swap if the registered value is still 'existing'.
+                            // If another accept thread already swapped it, TryUpdate returns false
+                            // and we retry (the losing session is already started via RunSessionAsync
+                            // and must be disposed — but since TryAdd failed, we know a session for
+                            // this peer is registered; the retry loop ensures we eventually replace
+                            // whatever is there).
+                            if (_sessions.TryUpdate(peerAddress, session, existing))
+                            {
+                                _logger.LogInformation("Replacing existing session for {Peer}", peerAddress);
+                                existing.MarkSilentClose();
+                                break;
+                            }
+                            // CAS failed — another thread replaced it; loop and retry.
+                        }
+                        else
+                        {
+                            // Existing was concurrently removed — try to add ours.
+                            if (_sessions.TryAdd(peerAddress, session))
+                                break;
+                            // TryAdd failed — another thread re-added for this peer; loop and retry.
+                        }
                     }
                 }
 

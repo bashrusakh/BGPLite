@@ -201,6 +201,7 @@ public class BgpSessionShutdownTests
             {
                 try { await ReadExactAsync(client, payload, notifCts.Token); }
                 catch (OperationCanceledException) { break; }
+                catch (IOException) { break; } // socket closed mid-payload — normal EOF
             }
             var msg = BgpMessageReader.ReadMessage(Concat(drainHeader, payload));
             if (msg is BgpNotificationMessage n)
@@ -244,14 +245,17 @@ public class BgpSessionShutdownTests
         client.Send(openBuf, 0, openLen, SocketFlags.None);
 
         // 2) Read session's OPEN, then KEEPALIVE (OpenSent → OpenConfirm).
+        // Use a bounded timeout so the test fails fast if the session fails to send
+        // the expected messages (e.g. if it sends a NOTIFICATION or encounters an error).
+        using var hsCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var header = new byte[BgpConstants.MessageHeaderSize];
-        await ReadExactAsync(client, header, CancellationToken.None);
+        await ReadExactAsync(client, header, hsCts.Token);
         Assert.Equal(BgpMessageType.Open, (BgpMessageType)header[18]);
         var totalLen = BgpMessageReader.GetMessageLength(header);
         if (totalLen > BgpConstants.MessageHeaderSize)
-            await ReadExactAsync(client, new byte[totalLen - BgpConstants.MessageHeaderSize], CancellationToken.None);
+            await ReadExactAsync(client, new byte[totalLen - BgpConstants.MessageHeaderSize], hsCts.Token);
 
-        await ReadExactAsync(client, header, CancellationToken.None);
+        await ReadExactAsync(client, header, hsCts.Token);
         Assert.Equal(BgpMessageType.Keepalive, (BgpMessageType)header[18]);
 
         // 3) Peer sends KEEPALIVE → Established.

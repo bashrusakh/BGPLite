@@ -83,6 +83,9 @@ checkpoints/
 *.onnx
 *.h5
 
+## GrayMatter (local agent memory)
+.graymatter/
+
 ## Python (if any scripts)
 __pycache__/
 *.pyc

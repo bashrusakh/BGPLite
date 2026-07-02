@@ -346,16 +346,16 @@ public sealed class BgpSession : IDisposable
                     Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.RemoteNotification, (int)TeardownReason.None);
                     return;
                 case BgpRouteRefreshMessage refresh:
-                    _logger.LogInformation("RouteRefresh received from {Peer} for AFI={Afi} SAFI={Safi}", _peerConfig.Address, refresh.Afi, refresh.Safi);
+                    _logger.LogInformation("RouteRefresh received from {Peer} for AFI={Afi} SAFI={Safi}", _peer, refresh.Afi, refresh.Safi);
                     if (!_remoteRouteRefresh)
                     {
-                        _logger.LogWarning("RouteRefresh received from {Peer} without negotiated capability, ignoring", _peerConfig.Address);
+                        _logger.LogWarning("RouteRefresh received from {Peer} without negotiated capability, ignoring", _peer);
                         break;
                     }
                     if (refresh.Afi == BgpConstants.Afi.IPv4 && refresh.Safi == BgpConstants.Safi.Unicast)
                         await RefreshRoutesAsync();
                     else
-                        _logger.LogDebug("RouteRefresh ignored: unsupported AFI/SAFI from {Peer}", _peerConfig.Address);
+                        _logger.LogDebug("RouteRefresh ignored: unsupported AFI/SAFI from {Peer}", _peer);
                     break;
             }
         }

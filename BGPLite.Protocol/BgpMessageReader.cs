@@ -27,6 +27,7 @@ public static class BgpMessageReader
             BgpMessageType.Keepalive => BgpKeepaliveMessage.Instance,
             BgpMessageType.Update => ParseUpdate(payload),
             BgpMessageType.Notification => ParseNotification(payload),
+            BgpMessageType.RouteRefresh => ParseRouteRefresh(payload),
             _ => throw new BgpParseException($"Unknown message type: {type}")
         };
     }
@@ -219,6 +220,27 @@ public static class BgpMessageReader
             ErrorCode = errorCode,
             SubErrorCode = subErrorCode,
             Data = data
+        };
+    }
+
+    #endregion
+
+    #region ROUTE_REFRESH
+
+    private static BgpRouteRefreshMessage ParseRouteRefresh(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length != 4)
+            throw new BgpParseException($"ROUTE_REFRESH message invalid length: {payload.Length} (expected 4)");
+
+        var afi = BinaryPrimitives.ReadUInt16BigEndian(payload);
+        var reserved = payload[2];
+        var safi = payload[3];
+
+        return new BgpRouteRefreshMessage
+        {
+            Afi = afi,
+            Reserved = reserved,
+            Safi = safi
         };
     }
 

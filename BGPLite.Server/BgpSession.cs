@@ -275,6 +275,13 @@ public sealed class BgpSession : IDisposable
                 case BgpKeepaliveMessage:
                     _logger.LogDebug("KeepAliveReceived from {Peer}", _peerConfig.Address);
                     break;
+                case BgpRouteRefreshMessage refresh:
+                    _logger.LogInformation("RouteRefresh received from {Peer} for AFI={Afi} SAFI={Safi}", _peerConfig.Address, refresh.Afi, refresh.Safi);
+                    if (refresh.Afi == BgpConstants.Afi.IPv4 && refresh.Safi == BgpConstants.Safi.Unicast)
+                        await RefreshRoutesAsync();
+                    else
+                        _logger.LogDebug("Unsupported AFI/SAFI for RouteRefresh from {Peer}: AFI={Afi} SAFI={Safi}", _peerConfig.Address, refresh.Afi, refresh.Safi);
+                    break;
                 case BgpNotificationMessage notif:
                     _logger.LogWarning("NotificationReceived from {Peer}: {Error}/{SubError}",
                         _peerConfig.Address, notif.ErrorCode, notif.SubErrorCode);

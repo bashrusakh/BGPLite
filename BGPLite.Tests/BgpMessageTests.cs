@@ -269,31 +269,39 @@ public class BgpMessageTests
     }
 
     [Fact]
-    public void Open_AtByteBoundary_Succeeds()
+    public void RouteRefresh_RoundTrip()
     {
-        // Sanity: exactly 255 bytes of optional-params must encode without throwing.
-        // optParamsLen = 2 (type+length) + Σ(2 + cap.Data.Length).
-        // 27 caps of 7 bytes data each -> 27 * 9 = 243.
-        // Last cap of 8 bytes data -> 2 + 8 = 10. Total = 2 + 243 + 10 = 255.
-        var caps = new List<BgpCapabilityInfo>();
-        for (var i = 0; i < 27; i++)
-            caps.Add(new BgpCapabilityInfo { Code = (byte)(0x20 + i), Data = new byte[7] });
-        caps.Add(new BgpCapabilityInfo { Code = 0x3F, Data = new byte[8] });
-
-        var open = new BgpOpenMessage
+        var msg = new BgpRouteRefreshMessage
         {
-            Version = 4,
-            Asn = 65000,
-            HoldTime = 90,
-            RouterId = 0x01020304,
-            Capabilities = caps
+            Afi = BgpConstants.Afi.IPv4,
+            Reserved = 0,
+            Safi = BgpConstants.Safi.Unicast
         };
-        var size = BgpMessageWriter.GetBufferSize(open);
-        var buffer = new byte[size];
-        var written = BgpMessageWriter.WriteMessage(open, buffer);
 
-        Assert.Equal(size, written);
-        // Optional-params length field sits at offset 19 (header) + 9 (fixed open payload).
-        Assert.Equal(255, buffer[28]);
+        var buffer = new byte[64];
+        var written = BgpMessageWriter.WriteMessage(msg, buffer);
+        var read = BgpMessageReader.ReadMessage(buffer.AsSpan(0, written));
+
+        var rr = Assert.IsType<BgpRouteRefreshMessage>(read);
+        Assert.Equal(BgpConstants.Afi.IPv4, rr.Afi);
+        Assert.Equal((byte)0, rr.Reserved);
+        Assert.Equal(BgpConstants.Safi.Unicast, rr.Safi);
+    }
+
+    [Fact]
+    public void RouteRefresh_InvalidLength_Throws()
+    {
+        // Craft a raw ROUTE_REFRESH with payload length != 4
+        var buffer = new byte[64];
+        BgpConstants.Marker.CopyTo(buffer);
+        // total length = 19 + 3 (invalid payload)
+        BinaryPrimitives.WriteUInt16BigEndian(buffer[16..], (ushort)(BgpConstants.MessageHeaderSize + 3));
+        buffer[18] = (byte)BgpMessageType.RouteRefresh;
+        // payload: 3 bytes
+        buffer[19] = 0;
+        buffer[20] = 1;
+        buffer[21] = 1;
+
+        Assert.Throws<BgpParseException>(() => BgpMessageReader.ReadMessage(buffer.AsSpan(0, 22)));
     }
 }

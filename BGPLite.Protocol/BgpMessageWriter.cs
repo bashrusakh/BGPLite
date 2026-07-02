@@ -12,6 +12,7 @@ public static class BgpMessageWriter
             BgpKeepaliveMessage => WriteKeepalive(buffer),
             BgpUpdateMessage update => WriteUpdate(update, buffer),
             BgpNotificationMessage notification => WriteNotification(notification, buffer),
+            BgpRouteRefreshMessage routeRefresh => WriteRouteRefresh(routeRefresh, buffer),
             _ => throw new ArgumentException($"Unknown message type: {message.Type}")
         };
     }
@@ -24,6 +25,7 @@ public static class BgpMessageWriter
             BgpKeepaliveMessage => BgpConstants.MessageHeaderSize,
             BgpUpdateMessage update => BgpConstants.MessageHeaderSize + GetUpdatePayloadSize(update),
             BgpNotificationMessage n => BgpConstants.MessageHeaderSize + 2 + (n.Data?.Length ?? 0),
+            BgpRouteRefreshMessage => BgpConstants.MessageHeaderSize + 4,
             _ => throw new ArgumentException($"Unknown message type: {message.Type}")
         };
     }
@@ -217,6 +219,24 @@ public static class BgpMessageWriter
         {
             msg.Data.AsSpan().CopyTo(buffer[p..]);
         }
+
+        return totalLength;
+    }
+
+    #endregion
+
+    #region ROUTE_REFRESH
+
+    private static int WriteRouteRefresh(BgpRouteRefreshMessage msg, Span<byte> buffer)
+    {
+        var totalLength = BgpConstants.MessageHeaderSize + 4;
+        WriteHeader(BgpMessageType.RouteRefresh, totalLength, buffer);
+
+        var p = BgpConstants.MessageHeaderSize;
+        BinaryPrimitives.WriteUInt16BigEndian(buffer[p..], msg.Afi);
+        p += 2;
+        buffer[p++] = msg.Reserved;
+        buffer[p++] = msg.Safi;
 
         return totalLength;
     }

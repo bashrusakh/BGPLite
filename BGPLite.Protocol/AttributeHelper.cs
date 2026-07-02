@@ -30,7 +30,7 @@ public static class AttributeHelper
         {
             Flags = BgpConstants.Attribute.FlagTransitive,
             TypeCode = BgpConstants.Attribute.AsPath,
-            Data = WritePathData(ases, fourByteAsn ? 4 : 2)
+            Data = WritePathData(ases, fourByteAsn ? 4 : 2, "AS_PATH")
         };
     }
 
@@ -44,7 +44,7 @@ public static class AttributeHelper
         {
             Flags = BgpConstants.Attribute.FlagOptional | BgpConstants.Attribute.FlagTransitive,
             TypeCode = BgpConstants.Attribute.As4Path,
-            Data = WritePathData(ases, 4)
+            Data = WritePathData(ases, 4, "AS4_PATH")
         };
     }
 
@@ -90,10 +90,10 @@ public static class AttributeHelper
         return ases.ToArray();
     }
 
-    private static byte[] WritePathData(uint[] ases, int asSize)
+    private static byte[] WritePathData(uint[] ases, int asSize, string attributeName)
     {
         if (ases.Length > byte.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(ases), "AS path segment length cannot exceed 255 ASNs.");
+            throw new ArgumentOutOfRangeException(nameof(ases), $"{attributeName} segment length cannot exceed 255 ASNs.");
 
         var data = new byte[2 + ases.Length * asSize];
         data[0] = BgpConstants.AsPath.AsSequence;

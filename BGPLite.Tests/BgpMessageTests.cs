@@ -222,4 +222,38 @@ public class BgpMessageTests
         var buffer = new byte[10];
         Assert.Throws<BgpParseException>(() => BgpMessageReader.ReadMessage(buffer));
     }
+
+    [Fact]
+    public void RouteRefresh_RoundTrip()
+    {
+        var msg = new BgpRouteRefreshMessage
+        {
+            Afi = BgpConstants.Afi.IPv4,
+            Reserved = 0,
+            Safi = BgpConstants.Safi.Unicast
+        };
+
+        var buffer = new byte[64];
+        var written = BgpMessageWriter.WriteMessage(msg, buffer);
+        var read = BgpMessageReader.ReadMessage(buffer.AsSpan(0, written));
+
+        var rr = Assert.IsType<BgpRouteRefreshMessage>(read);
+        Assert.Equal(BgpConstants.Afi.IPv4, rr.Afi);
+        Assert.Equal((byte)0, rr.Reserved);
+        Assert.Equal(BgpConstants.Safi.Unicast, rr.Safi);
+    }
+
+    [Fact]
+    public void RouteRefresh_InvalidLength_Throws()
+    {
+        var buffer = new byte[64];
+        BgpConstants.Marker.CopyTo(buffer);
+        BinaryPrimitives.WriteUInt16BigEndian(buffer[16..], (ushort)(BgpConstants.MessageHeaderSize + 3));
+        buffer[18] = (byte)BgpMessageType.RouteRefresh;
+        buffer[19] = 0;
+        buffer[20] = 1;
+        buffer[21] = 1;
+
+        Assert.Throws<BgpParseException>(() => BgpMessageReader.ReadMessage(buffer.AsSpan(0, 22)));
+    }
 }

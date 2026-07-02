@@ -47,6 +47,7 @@ public sealed class BgpSession : IDisposable
     private int _disposed;
     private uint _remoteAsn;
     private bool _remoteFourByteAsn;
+    private bool _remoteRouteRefresh;
     private bool _localFourByteAsn = true;
     private ushort _negotiatedHoldTime;
     private List<IpPrefix> _advertisedPrefixes = [];
@@ -344,6 +345,18 @@ public sealed class BgpSession : IDisposable
                     // does not reply with a Cease.
                     Interlocked.CompareExchange(ref _teardownReason, (int)TeardownReason.RemoteNotification, (int)TeardownReason.None);
                     return;
+                case BgpRouteRefreshMessage refresh:
+                    _logger.LogInformation("RouteRefresh received from {Peer} for AFI={Afi} SAFI={Safi}", _peerConfig.Address, refresh.Afi, refresh.Safi);
+                    if (!_remoteRouteRefresh)
+                    {
+                        _logger.LogWarning("RouteRefresh received from {Peer} without negotiated capability, ignoring", _peerConfig.Address);
+                        break;
+                    }
+                    if (refresh.Afi == BgpConstants.Afi.IPv4 && refresh.Safi == BgpConstants.Safi.Unicast)
+                        await RefreshRoutesAsync();
+                    else
+                        _logger.LogDebug("RouteRefresh ignored: unsupported AFI/SAFI from {Peer}", _peerConfig.Address);
+                    break;
             }
         }
     }
@@ -1027,6 +1040,7 @@ public sealed class BgpSession : IDisposable
 
         _remoteFourByteAsn = CapabilityHelper.GetRemoteAsn(open).HasValue;
         _remoteAsn = CapabilityHelper.GetEffectiveAsn(open);
+        _remoteRouteRefresh = open.Capabilities.Any(c => c.Code == BgpConstants.Capability.RouteRefresh);
 
         _onPeerIdentified?.Invoke(_peerConfig.Address, _remoteAsn);
 

@@ -393,7 +393,9 @@ public sealed class BgpSession : IDisposable
         {
             try
             {
-                var origin = BgpOrigin.Incomplete;
+                var originSeen = false;
+                var asPathSeen = false;
+                var nextHopSeen = false;
                 uint nextHop = 0;
                 uint[] asPath = [];
                 uint[] communities = [];
@@ -406,10 +408,12 @@ public sealed class BgpSession : IDisposable
                         case BgpConstants.Attribute.Origin:
                             if (attr.Data.Length < 1)
                                 throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed ORIGIN attribute");
-                            origin = AttributeHelper.ReadOrigin(attr);
+                            AttributeHelper.ReadOrigin(attr);
+                            originSeen = true;
                             break;
                         case BgpConstants.Attribute.AsPath:
                             asPath = AttributeHelper.ReadAsPath(attr, _remoteFourByteAsn);
+                            asPathSeen = true;
                             break;
                         case BgpConstants.Attribute.As4Path when !_remoteFourByteAsn:
                             as4Path = AttributeHelper.ReadAs4Path(attr);
@@ -418,6 +422,7 @@ public sealed class BgpSession : IDisposable
                             if (attr.Data.Length < 4)
                                 throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed NEXT_HOP attribute");
                             nextHop = AttributeHelper.ReadNextHop(attr);
+                            nextHopSeen = true;
                             break;
                         case BgpConstants.Attribute.Community:
                             communities = AttributeHelper.ReadCommunities(attr);
@@ -425,6 +430,7 @@ public sealed class BgpSession : IDisposable
                     }
                 }
 
+                ValidateMandatoryAttributes(originSeen, asPathSeen, nextHopSeen);
                 asPath = MergeAsPathWithAs4Path(asPath, as4Path);
 
                 foreach (var nlri in update.Nlri)
@@ -805,35 +811,41 @@ public sealed class BgpSession : IDisposable
     }
 
     /// <summary>
-    /// Reconstructs the true AS path for a 2-byte peer by replacing AS_TRANS placeholders
-    /// with the corresponding AS4_PATH values. Internal for test coverage.
+    /// Validates that a route announcement carried the mandatory well-known attributes.
+    /// Internal for test coverage.
+    /// </summary>
+    internal static void ValidateMandatoryAttributes(bool originSeen, bool asPathSeen, bool nextHopSeen)
+    {
+        if (!originSeen)
+            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Missing mandatory ORIGIN attribute");
+        if (!asPathSeen)
+            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Missing mandatory AS_PATH attribute");
+        if (!nextHopSeen)
+            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Missing mandatory NEXT_HOP attribute");
+    }
+
+    /// <summary>
+    /// Reconstructs the true AS path for a 2-byte peer using RFC 6793 trailing-sequence
+    /// reconstruction. The last N ASNs in AS_PATH are replaced with the AS4_PATH values,
+    /// where N = min(AS_PATH length, AS4_PATH length). Internal for test coverage.
     /// </summary>
     internal static uint[] MergeAsPathWithAs4Path(uint[] asPath, uint[] as4Path)
     {
         if (as4Path.Length == 0)
             return asPath;
 
-        var merged = new uint[asPath.Length];
-        var as4Index = 0;
-
-        for (var i = 0; i < asPath.Length; i++)
+        if (as4Path.Length >= asPath.Length)
         {
-            var asn = asPath[i];
-            if (asn == BgpConstants.AsPath.AsTrans)
-            {
-                if (as4Index >= as4Path.Length)
-                    throw new BgpParseException("Malformed AS4_PATH attribute");
+            if (as4Path.Length > asPath.Length)
+                return asPath;
 
-                merged[i] = as4Path[as4Index++];
-            }
-            else
-            {
-                merged[i] = asn;
-            }
+            return as4Path;
         }
 
-        if (as4Index != as4Path.Length)
-            throw new BgpParseException("Malformed AS4_PATH attribute");
+        var merged = new uint[asPath.Length];
+        var leadingCount = asPath.Length - as4Path.Length;
+        Array.Copy(asPath, 0, merged, 0, leadingCount);
+        Array.Copy(as4Path, 0, merged, leadingCount, as4Path.Length);
 
         return merged;
     }

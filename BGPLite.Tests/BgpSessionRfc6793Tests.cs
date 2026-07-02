@@ -95,15 +95,36 @@ public class BgpSessionRfc6793Tests
     public void MergeAsPathWithAs4Path_ReconstructsTrueSequence()
     {
         var merged = BgpSession.MergeAsPathWithAs4Path(
-            [BgpConstants.AsPath.AsTrans, 65001u],
-            [200000u]);
+            [65010u, BgpConstants.AsPath.AsTrans, 65001u],
+            [200000u, 65001u]);
 
-        Assert.Equal([200000u, 65001u], merged);
+        Assert.Equal([65010u, 200000u, 65001u], merged);
     }
 
     [Fact]
-    public void MergeAsPathWithAs4Path_MismatchedLengths_Throws()
+    public void MergeAsPathWithAs4Path_As4PathLongerThanAsPath_IgnoresAs4Path()
     {
-        Assert.Throws<BgpParseException>(() => BgpSession.MergeAsPathWithAs4Path([65001u], [200000u]));
+        var merged = BgpSession.MergeAsPathWithAs4Path([65001u], [200000u, 65002u]);
+
+        Assert.Equal([65001u], merged);
+    }
+
+    [Theory]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    public void ValidateMandatoryAttributes_MissingRequiredAttribute_Throws(bool originSeen, bool asPathSeen, bool nextHopSeen)
+    {
+        var ex = Assert.Throws<BgpNotificationException>(() =>
+            BgpSession.ValidateMandatoryAttributes(originSeen, asPathSeen, nextHopSeen));
+
+        Assert.Equal(BgpConstants.Error.UpdateMessageError, ex.ErrorCode);
+        Assert.Equal(BgpConstants.SubError.Unspecific, ex.SubErrorCode);
+    }
+
+    [Fact]
+    public void ValidateMandatoryAttributes_AllPresent_Succeeds()
+    {
+        BgpSession.ValidateMandatoryAttributes(true, true, true);
     }
 }

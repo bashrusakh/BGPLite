@@ -53,6 +53,14 @@ public sealed class BgpSession : IDisposable
     private List<IpPrefix> _advertisedPrefixes = [];
     private TimeSpan _keepAliveInterval;
     private long _lastReceivedTicks; // UTC ticks of last received message; drives the HoldTimer (Interlocked)
+    // Debounce ROUTE_REFRESH (RFC 2918): rate-limit per-session route re-announcements to avoid
+    // DoS where a peer spams type-5 and forces a full re-advertise. Initial 0 = never refreshed.
+    // Read/written via Interlocked so RefreshRoutesAsync and ReadLoopAsync can't race.
+    private long _lastRouteRefreshTicks;
+    // Minimum gap between peer-triggered route refreshes. 1s is a reasonable default:
+    // long enough to make flood-DoS impractical, short enough that a legitimate peer retry
+    // after a lost UPDATE still gets a fresh advertisement promptly.
+    private static readonly TimeSpan MinRouteRefreshInterval = TimeSpan.FromSeconds(1);
 
     public BgpFsmState State => _state;
     public PeerConfig Peer => _peerConfig;
@@ -352,10 +360,29 @@ public sealed class BgpSession : IDisposable
                         _logger.LogWarning("RouteRefresh received from {Peer} without negotiated capability, ignoring", _peer);
                         break;
                     }
-                    if (refresh.Afi == BgpConstants.Afi.IPv4 && refresh.Safi == BgpConstants.Safi.Unicast)
-                        await RefreshRoutesAsync();
-                    else
+                    if (refresh.Afi != BgpConstants.Afi.IPv4 || refresh.Safi != BgpConstants.Safi.Unicast)
+                    {
                         _logger.LogDebug("RouteRefresh ignored: unsupported AFI/SAFI from {Peer}", _peer);
+                        break;
+                    }
+                    // Debounce: ignore ROUTE_REFRESH floods. Atomic check-and-set so a burst of N
+                    // concurrent route refreshes from the peer can't all slip through and trigger
+                    // N full re-announcements. First caller wins; the rest see a non-zero
+                    // previous-timestamp and bail out cheaply with a debug log.
+                    var nowTicks = DateTime.UtcNow.Ticks;
+                    var prevTicks = Interlocked.Read(ref _lastRouteRefreshTicks);
+                    if (prevTicks != 0 && new TimeSpan(nowTicks - prevTicks) < MinRouteRefreshInterval)
+                    {
+                        _logger.LogDebug("RouteRefresh rate-limited from {Peer} (last refresh {Ago} ago)",
+                            _peer, DateTime.UtcNow - new DateTime(prevTicks, DateTimeKind.Utc));
+                        break;
+                    }
+                    if (Interlocked.CompareExchange(ref _lastRouteRefreshTicks, nowTicks, prevTicks) != prevTicks)
+                    {
+                        // Another refresh raced ahead of us; the winning call will do the work.
+                        break;
+                    }
+                    await RefreshRoutesAsync();
                     break;
             }
         }

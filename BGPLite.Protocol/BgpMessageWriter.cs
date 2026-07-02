@@ -70,7 +70,16 @@ public static class BgpMessageWriter
 
         var capDataLen = 0;
         foreach (var cap in capabilities)
-            capDataLen += 2 + cap.Data.Length;
+        {
+            var capLen = 2 + cap.Data.Length;
+            if (capLen > byte.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(capabilities), "Capability data length must fit in one byte.");
+
+            if (capDataLen > byte.MaxValue - 2 - capLen)
+                throw new ArgumentOutOfRangeException(nameof(capabilities), "OPEN optional parameters length must fit in one byte.");
+
+            capDataLen += capLen;
+        }
 
         return 2 + capDataLen;
     }

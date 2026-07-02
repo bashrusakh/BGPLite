@@ -31,9 +31,13 @@ public static class AttributeHelper
             var segmentType = attr.Data[offset++];
             var segmentLength = attr.Data[offset++];
 
+            if (segmentType != BgpConstants.AsPath.AsSequence &&
+                segmentType != BgpConstants.AsPath.AsSet)
+                throw new BgpParseException($"Invalid AS_PATH segment type: {segmentType}");
+
             var segBytes = segmentLength * asSize;
             if (offset + segBytes > attr.Data.Length)
-                break; // truncated segment — stop rather than read out of bounds
+                throw new BgpParseException("Truncated AS_PATH segment");
 
             for (var i = 0; i < segmentLength; i++)
             {
@@ -44,13 +48,18 @@ public static class AttributeHelper
                 offset += asSize;
             }
         }
-        // NOTE: AS4_PATH (attr 17) is not parsed/merged here; AS_PATH is not re-advertised
-        // by this server, so AS_TRANS(23456) reconstruction (RFC 6793 §6) is unnecessary.
+
+        if (offset != attr.Data.Length)
+            throw new BgpParseException("Malformed AS_PATH attribute");
+
         return ases.ToArray();
     }
 
     public static PathAttribute WriteAsPath(uint[] ases, bool fourByteAsn)
     {
+        if (ases.Length > byte.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(ases), "AS_PATH segment length cannot exceed 255 ASNs.");
+
         var asSize = fourByteAsn ? 4 : 2;
         var data = new byte[2 + ases.Length * asSize];
         data[0] = BgpConstants.AsPath.AsSequence;
@@ -85,6 +94,9 @@ public static class AttributeHelper
     /// </summary>
     public static PathAttribute WriteAs4Path(uint[] ases)
     {
+        if (ases.Length > byte.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(ases), "AS4_PATH segment length cannot exceed 255 ASNs.");
+
         var data = new byte[2 + ases.Length * 4];
         data[0] = BgpConstants.AsPath.AsSequence;
         data[1] = (byte)ases.Length;
@@ -119,9 +131,13 @@ public static class AttributeHelper
             var segmentType = attr.Data[offset++];
             var segmentLength = attr.Data[offset++];
 
+            if (segmentType != BgpConstants.AsPath.AsSequence &&
+                segmentType != BgpConstants.AsPath.AsSet)
+                throw new BgpParseException($"Invalid AS4_PATH segment type: {segmentType}");
+
             var segBytes = segmentLength * 4;
             if (offset + segBytes > attr.Data.Length)
-                break; // truncated segment
+                throw new BgpParseException("Truncated AS4_PATH segment");
 
             for (var i = 0; i < segmentLength; i++)
             {
@@ -129,6 +145,9 @@ public static class AttributeHelper
                 offset += 4;
             }
         }
+        if (offset != attr.Data.Length)
+            throw new BgpParseException("Malformed AS4_PATH attribute");
+
         return ases.ToArray();
     }
 

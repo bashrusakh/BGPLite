@@ -315,6 +315,61 @@ public class BgpMessageTests
     }
 
     [Fact]
+    public void As4Path_OverlongSegment_Throws()
+    {
+        var asns = Enumerable.Range(0, 256).Select(i => (uint)i).ToArray();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => AttributeHelper.WriteAs4Path(asns));
+    }
+
+    [Fact]
+    public void AsPath_OverlongSegment_Throws()
+    {
+        var asns = Enumerable.Range(0, 256).Select(i => (uint)i).ToArray();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => AttributeHelper.WriteAsPath(asns, fourByteAsn: false));
+    }
+
+    [Fact]
+    public void AsPath_TruncatedSegment_Throws()
+    {
+        var attr = new PathAttribute
+        {
+            Flags = BgpConstants.Attribute.FlagTransitive,
+            TypeCode = BgpConstants.Attribute.AsPath,
+            Data = new byte[] { BgpConstants.AsPath.AsSequence, 2, 0x00, 0x01 }
+        };
+
+        Assert.Throws<BgpParseException>(() => AttributeHelper.ReadAsPath(attr, fourByteAsn: false));
+    }
+
+    [Fact]
+    public void AsPath_InvalidSegmentType_Throws()
+    {
+        var attr = new PathAttribute
+        {
+            Flags = BgpConstants.Attribute.FlagTransitive,
+            TypeCode = BgpConstants.Attribute.AsPath,
+            Data = new byte[] { 0x7F, 1, 0x00, 0x01 }
+        };
+
+        Assert.Throws<BgpParseException>(() => AttributeHelper.ReadAsPath(attr, fourByteAsn: false));
+    }
+
+    [Fact]
+    public void As4Path_TruncatedSegment_Throws()
+    {
+        var attr = new PathAttribute
+        {
+            Flags = BgpConstants.Attribute.FlagOptional | BgpConstants.Attribute.FlagTransitive,
+            TypeCode = BgpConstants.Attribute.As4Path,
+            Data = new byte[] { BgpConstants.AsPath.AsSequence, 2, 0x00, 0x00, 0x00, 0x01 }
+        };
+
+        Assert.Throws<BgpParseException>(() => AttributeHelper.ReadAs4Path(attr));
+    }
+
+    [Fact]
     public void AsPath_2Byte_WithAsTrans_Roundtrip()
     {
         // 2-byte-only peer: AS_PATH with AS_TRANS (23456) for ASN > 65535

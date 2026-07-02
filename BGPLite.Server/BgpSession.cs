@@ -391,50 +391,63 @@ public sealed class BgpSession : IDisposable
         // Process announcements
         if (update.Nlri.Count > 0)
         {
-            var origin = BgpOrigin.Incomplete;
-            uint nextHop = 0;
-            uint[] asPath = [];
-            uint[] communities = [];
-
-            foreach (var attr in update.PathAttributes)
+            try
             {
-                switch (attr.TypeCode)
+                var origin = BgpOrigin.Incomplete;
+                uint nextHop = 0;
+                uint[] asPath = [];
+                uint[] communities = [];
+                uint[] as4Path = [];
+
+                foreach (var attr in update.PathAttributes)
                 {
-                    case BgpConstants.Attribute.Origin:
-                        if (attr.Data.Length < 1)
-                            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed ORIGIN attribute");
-                        origin = AttributeHelper.ReadOrigin(attr);
-                        break;
-                    case BgpConstants.Attribute.AsPath:
-                        asPath = AttributeHelper.ReadAsPath(attr, _remoteFourByteAsn);
-                        break;
-                    case BgpConstants.Attribute.NextHop:
-                        if (attr.Data.Length < 4)
-                            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed NEXT_HOP attribute");
-                        nextHop = AttributeHelper.ReadNextHop(attr);
-                        break;
-                    case BgpConstants.Attribute.Community:
-                        communities = AttributeHelper.ReadCommunities(attr);
-                        break;
+                    switch (attr.TypeCode)
+                    {
+                        case BgpConstants.Attribute.Origin:
+                            if (attr.Data.Length < 1)
+                                throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed ORIGIN attribute");
+                            origin = AttributeHelper.ReadOrigin(attr);
+                            break;
+                        case BgpConstants.Attribute.AsPath:
+                            asPath = AttributeHelper.ReadAsPath(attr, _remoteFourByteAsn);
+                            break;
+                        case BgpConstants.Attribute.As4Path when !_remoteFourByteAsn:
+                            as4Path = AttributeHelper.ReadAs4Path(attr);
+                            break;
+                        case BgpConstants.Attribute.NextHop:
+                            if (attr.Data.Length < 4)
+                                throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Malformed NEXT_HOP attribute");
+                            nextHop = AttributeHelper.ReadNextHop(attr);
+                            break;
+                        case BgpConstants.Attribute.Community:
+                            communities = AttributeHelper.ReadCommunities(attr);
+                            break;
+                    }
+                }
+
+                asPath = MergeAsPathWithAs4Path(asPath, as4Path);
+
+                foreach (var nlri in update.Nlri)
+                {
+                    var route = new Route
+                    {
+                        Prefix = nlri.Address,
+                        PrefixLength = nlri.Length,
+                        NextHop = nextHop,
+                        AsPath = asPath,
+                        Communities = communities
+                    };
+
+                    if (_routeFilter.AcceptIncoming(route, _peerConfig))
+                    {
+                        _routeTable.AddOrUpdate(route);
+                        _logger.LogDebug("Route added: {Prefix} via {NextHop}", nlri, BgpConstants.UintToIPAddress(nextHop));
+                    }
                 }
             }
-
-            foreach (var nlri in update.Nlri)
+            catch (BgpParseException ex)
             {
-                var route = new Route
-                {
-                    Prefix = nlri.Address,
-                    PrefixLength = nlri.Length,
-                    NextHop = nextHop,
-                    AsPath = asPath,
-                    Communities = communities
-                };
-
-                if (_routeFilter.AcceptIncoming(route, _peerConfig))
-                {
-                    _routeTable.AddOrUpdate(route);
-                    _logger.LogDebug("Route added: {Prefix} via {NextHop}", nlri, BgpConstants.UintToIPAddress(nextHop));
-                }
+                throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, ex.Message);
             }
         }
 
@@ -735,16 +748,7 @@ public sealed class BgpSession : IDisposable
         // one group would be tagged with another group's communities on the wire.
         foreach (var groupRoutes in GroupByCommunitySet(routes))
         {
-            var attrs = new List<PathAttribute>
-            {
-                AttributeHelper.WriteOrigin(BgpOrigin.Igp),
-            };
-            attrs.AddRange(BuildAsPathAttributes(_bgpConfig.Asn, _localFourByteAsn));
-            attrs.Add(AttributeHelper.WriteNextHop(nextHop));
-
-            var communities = groupRoutes[0].Communities;
-            if (communities.Length > 0)
-                attrs.Add(AttributeHelper.WriteCommunities(communities));
+            var attrs = BuildUpdateAttributes(_bgpConfig.Asn, _localFourByteAsn, nextHop, groupRoutes[0].Communities);
 
             var nlri = groupRoutes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList();
             await SendUpdateBatchAsync(attrs, nlri);
@@ -774,6 +778,64 @@ public sealed class BgpSession : IDisposable
                 attrs.Add(AttributeHelper.WriteAs4Path([localAsn]));
         }
         return attrs;
+    }
+
+    /// <summary>
+    /// Builds outbound UPDATE path attributes in RFC order: ORIGIN, AS_PATH, NEXT_HOP,
+    /// COMMUNITY, AS4_PATH. Internal for test coverage.
+    /// </summary>
+    internal static List<PathAttribute> BuildUpdateAttributes(uint localAsn, bool localFourByteAsn, uint nextHop, uint[] communities)
+    {
+        var attrs = new List<PathAttribute>(5)
+        {
+            AttributeHelper.WriteOrigin(BgpOrigin.Igp),
+        };
+
+        var asPathAttrs = BuildAsPathAttributes(localAsn, localFourByteAsn);
+        attrs.Add(asPathAttrs[0]);
+        attrs.Add(AttributeHelper.WriteNextHop(nextHop));
+
+        if (communities.Length > 0)
+            attrs.Add(AttributeHelper.WriteCommunities(communities));
+
+        if (asPathAttrs.Count > 1)
+            attrs.Add(asPathAttrs[1]);
+
+        return attrs;
+    }
+
+    /// <summary>
+    /// Reconstructs the true AS path for a 2-byte peer by replacing AS_TRANS placeholders
+    /// with the corresponding AS4_PATH values. Internal for test coverage.
+    /// </summary>
+    internal static uint[] MergeAsPathWithAs4Path(uint[] asPath, uint[] as4Path)
+    {
+        if (as4Path.Length == 0)
+            return asPath;
+
+        var merged = new uint[asPath.Length];
+        var as4Index = 0;
+
+        for (var i = 0; i < asPath.Length; i++)
+        {
+            var asn = asPath[i];
+            if (asn == BgpConstants.AsPath.AsTrans)
+            {
+                if (as4Index >= as4Path.Length)
+                    throw new BgpParseException("Malformed AS4_PATH attribute");
+
+                merged[i] = as4Path[as4Index++];
+            }
+            else
+            {
+                merged[i] = asn;
+            }
+        }
+
+        if (as4Index != as4Path.Length)
+            throw new BgpParseException("Malformed AS4_PATH attribute");
+
+        return merged;
     }
 
     /// <summary>

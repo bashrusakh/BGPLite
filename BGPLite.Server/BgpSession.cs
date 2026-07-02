@@ -374,7 +374,7 @@ public sealed class BgpSession : IDisposable
                     if (prevTicks != 0 && new TimeSpan(nowTicks - prevTicks) < MinRouteRefreshInterval)
                     {
                         _logger.LogDebug("RouteRefresh rate-limited from {Peer} (last refresh {Ago} ago)",
-                            _peer, DateTime.UtcNow - new DateTime(prevTicks, DateTimeKind.Utc));
+                            _peer, new TimeSpan(nowTicks - prevTicks));
                         break;
                     }
                     if (Interlocked.CompareExchange(ref _lastRouteRefreshTicks, nowTicks, prevTicks) != prevTicks)

@@ -269,6 +269,35 @@ public class BgpMessageTests
     }
 
     [Fact]
+    public void Open_AtByteBoundary_Succeeds()
+    {
+        // Sanity: exactly 255 bytes of optional-params must encode without throwing.
+        // optParamsLen = 2 (type+length) + Σ(2 + cap.Data.Length).
+        // 27 caps of 7 bytes data each -> 27 * 9 = 243.
+        // Last cap of 8 bytes data -> 2 + 8 = 10. Total = 2 + 243 + 10 = 255.
+        var caps = new List<BgpCapabilityInfo>();
+        for (var i = 0; i < 27; i++)
+            caps.Add(new BgpCapabilityInfo { Code = (byte)(0x20 + i), Data = new byte[7] });
+        caps.Add(new BgpCapabilityInfo { Code = 0x3F, Data = new byte[8] });
+
+        var open = new BgpOpenMessage
+        {
+            Version = 4,
+            Asn = 65000,
+            HoldTime = 90,
+            RouterId = 0x01020304,
+            Capabilities = caps
+        };
+        var size = BgpMessageWriter.GetBufferSize(open);
+        var buffer = new byte[size];
+        var written = BgpMessageWriter.WriteMessage(open, buffer);
+
+        Assert.Equal(size, written);
+        // Optional-params length field sits at offset 19 (header) + 9 (fixed open payload).
+        Assert.Equal(255, buffer[28]);
+    }
+
+    [Fact]
     public void RouteRefresh_RoundTrip()
     {
         var msg = new BgpRouteRefreshMessage

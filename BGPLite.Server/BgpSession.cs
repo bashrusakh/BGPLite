@@ -28,6 +28,7 @@ public sealed class BgpSession : IDisposable
     private BgpFsmState _state = BgpFsmState.Idle;
     private uint _remoteAsn;
     private bool _remoteFourByteAsn;
+    private bool _remoteRouteRefresh;
     private bool _localFourByteAsn = true;
     private ushort _negotiatedHoldTime;
     private List<IpPrefix> _advertisedPrefixes = [];
@@ -277,6 +278,11 @@ public sealed class BgpSession : IDisposable
                     break;
                 case BgpRouteRefreshMessage refresh:
                     _logger.LogInformation("RouteRefresh received from {Peer} for AFI={Afi} SAFI={Safi}", _peerConfig.Address, refresh.Afi, refresh.Safi);
+                    if (!_remoteRouteRefresh)
+                    {
+                        _logger.LogWarning("RouteRefresh received from {Peer} without negotiated capability, ignoring", _peerConfig.Address);
+                        break;
+                    }
                     if (refresh.Afi == BgpConstants.Afi.IPv4 && refresh.Safi == BgpConstants.Safi.Unicast)
                         await RefreshRoutesAsync();
                     else
@@ -914,6 +920,7 @@ public sealed class BgpSession : IDisposable
             throw new BgpNotificationException(BgpConstants.Error.OpenMessageError, BgpConstants.SubError.UnsupportedVersion, $"Unsupported BGP version: {open.Version}");
 
         _remoteFourByteAsn = CapabilityHelper.GetRemoteAsn(open).HasValue;
+        _remoteRouteRefresh = open.Capabilities.Any(c => c.Code == BgpConstants.Capability.RouteRefresh);
         _remoteAsn = CapabilityHelper.GetEffectiveAsn(open);
 
         _onPeerIdentified?.Invoke(_peerConfig.Address, _remoteAsn);

@@ -399,10 +399,10 @@ public class BgpMessageTests
     }
 
     [Fact]
-    public void AsPathAsTrans_Constant_Is23456()
+    public void AsPath_AsTrans_Constant_Is23456()
     {
         // RFC 6793: AS_TRANS = 23456
-        Assert.Equal(23456u, BgpConstants.AsPathAsTrans);
+        Assert.Equal(23456u, BgpConstants.AsPath.AsTrans);
     }
 
     #endregion

@@ -738,27 +738,9 @@ public sealed class BgpSession : IDisposable
             var attrs = new List<PathAttribute>
             {
                 AttributeHelper.WriteOrigin(BgpOrigin.Igp),
-                AttributeHelper.WriteNextHop(nextHop)
             };
-
-            // RFC 6793 §6: AS_PATH encoding depends on peer capability
-            if (_localFourByteAsn)
-            {
-                // 4-byte peer: send AS_PATH in 4-byte form
-                attrs.Insert(1, AttributeHelper.WriteAsPath([_bgpConfig.Asn], fourByteAsn: true));
-            }
-            else
-            {
-                // 2-byte-only peer: send AS_PATH in 2-byte form with AS_TRANS if needed
-                var asPathAsn = _bgpConfig.Asn > ushort.MaxValue
-                    ? BgpConstants.AsPathAsTrans // 23456
-                    : _bgpConfig.Asn;
-                attrs.Insert(1, AttributeHelper.WriteAsPath([asPathAsn], fourByteAsn: false));
-
-                // If local ASN > 65535, append AS4_PATH (type 17) with true 4-byte ASN
-                if (_bgpConfig.Asn > ushort.MaxValue)
-                    attrs.Add(AttributeHelper.WriteAs4Path([_bgpConfig.Asn]));
-            }
+            attrs.AddRange(BuildAsPathAttributes(_bgpConfig.Asn, _localFourByteAsn));
+            attrs.Add(AttributeHelper.WriteNextHop(nextHop));
 
             var communities = groupRoutes[0].Communities;
             if (communities.Length > 0)
@@ -767,6 +749,31 @@ public sealed class BgpSession : IDisposable
             var nlri = groupRoutes.Select(r => new IpPrefix(r.Prefix, r.PrefixLength)).ToList();
             await SendUpdateBatchAsync(attrs, nlri);
         }
+    }
+
+    /// <summary>
+    /// Builds AS_PATH and optionally AS4_PATH attributes per RFC 6793 §6.
+    /// - <paramref name="localFourByteAsn"/>=true: single 4-byte AS_PATH.
+    /// - <paramref name="localFourByteAsn"/>=false: 2-byte AS_PATH (AS_TRANS(23456) if
+    ///   <paramref name="localAsn"/> &gt; 65535) plus AS4_PATH carrying the true 4-byte ASN.
+    /// Internal for test coverage.
+    /// </summary>
+    internal static List<PathAttribute> BuildAsPathAttributes(uint localAsn, bool localFourByteAsn)
+    {
+        var attrs = new List<PathAttribute>(2);
+        if (localFourByteAsn)
+        {
+            attrs.Add(AttributeHelper.WriteAsPath([localAsn], fourByteAsn: true));
+        }
+        else
+        {
+            var asPathAsn = localAsn > ushort.MaxValue ? BgpConstants.AsPath.AsTrans : localAsn;
+            attrs.Add(AttributeHelper.WriteAsPath([asPathAsn], fourByteAsn: false));
+
+            if (localAsn > ushort.MaxValue)
+                attrs.Add(AttributeHelper.WriteAs4Path([localAsn]));
+        }
+        return attrs;
     }
 
     /// <summary>
@@ -944,7 +951,7 @@ public sealed class BgpSession : IDisposable
                 restartState: true, restartTime, forwardingState: _bgpConfig.GracefulRestartForwardingState));
         }
 
-        var asn16 = _bgpConfig.Asn > ushort.MaxValue ? (ushort)23456 : (ushort)_bgpConfig.Asn;
+        var asn16 = _bgpConfig.Asn > ushort.MaxValue ? (ushort)BgpConstants.AsPath.AsTrans : (ushort)_bgpConfig.Asn;
         var routerId = BgpConstants.IPAddressToUint(_bgpConfig.GetRouterIdAddress());
 
         _logger.LogInformation(

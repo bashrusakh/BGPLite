@@ -66,10 +66,10 @@ public static class BgpConstants
     {
         public const byte AsSet = 1;
         public const byte AsSequence = 2;
-    }
 
-    /// <summary>AS_TRANS (RFC 6793) — placeholder for 2-byte-only peers when local ASN > 65535.</summary>
-    public const uint AsPathAsTrans = 23456;
+        /// <summary>AS_TRANS (RFC 6793) — placeholder for 2-byte-only peers when local ASN > 65535.</summary>
+        public const uint AsTrans = 23456;
+    }
 
     public static class Capability
     {

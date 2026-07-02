@@ -35,6 +35,7 @@ public static class BgpConstants
         public const byte Unspecific = 0;
         public const byte UnsupportedVersion = 1;
         public const byte BadPeerAs = 2;
+        public const byte MissingWellKnownAttribute = 3;
         public const byte BadBgpIdentifier = 3;
         public const byte UnacceptableHoldTime = 6;
     }

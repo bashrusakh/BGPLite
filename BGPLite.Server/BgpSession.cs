@@ -817,11 +817,11 @@ public sealed class BgpSession : IDisposable
     internal static void ValidateMandatoryAttributes(bool originSeen, bool asPathSeen, bool nextHopSeen)
     {
         if (!originSeen)
-            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Missing mandatory ORIGIN attribute");
+            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.MissingWellKnownAttribute, "Missing mandatory ORIGIN attribute");
         if (!asPathSeen)
-            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Missing mandatory AS_PATH attribute");
+            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.MissingWellKnownAttribute, "Missing mandatory AS_PATH attribute");
         if (!nextHopSeen)
-            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.Unspecific, "Missing mandatory NEXT_HOP attribute");
+            throw new BgpNotificationException(BgpConstants.Error.UpdateMessageError, BgpConstants.SubError.MissingWellKnownAttribute, "Missing mandatory NEXT_HOP attribute");
     }
 
     /// <summary>

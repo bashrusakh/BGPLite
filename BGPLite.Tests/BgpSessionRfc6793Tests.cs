@@ -109,6 +109,24 @@ public class BgpSessionRfc6793Tests
         Assert.Equal([65001u], merged);
     }
 
+    [Fact]
+    public void MergeAsPathWithAs4Path_EqualLengths_ReturnsAs4Path()
+    {
+        var merged = BgpSession.MergeAsPathWithAs4Path(
+            [BgpConstants.AsPath.AsTrans, 65001u],
+            [200000u, 65001u]);
+
+        Assert.Equal([200000u, 65001u], merged);
+    }
+
+    [Fact]
+    public void MergeAsPathWithAs4Path_EmptyAs4Path_ReturnsAsPathUnchanged()
+    {
+        var merged = BgpSession.MergeAsPathWithAs4Path([65010u, 65001u], []);
+
+        Assert.Equal([65010u, 65001u], merged);
+    }
+
     [Theory]
     [InlineData(false, true, true)]
     [InlineData(true, false, true)]
@@ -119,7 +137,7 @@ public class BgpSessionRfc6793Tests
             BgpSession.ValidateMandatoryAttributes(originSeen, asPathSeen, nextHopSeen));
 
         Assert.Equal(BgpConstants.Error.UpdateMessageError, ex.ErrorCode);
-        Assert.Equal(BgpConstants.SubError.Unspecific, ex.SubErrorCode);
+        Assert.Equal(BgpConstants.SubError.MissingWellKnownAttribute, ex.SubErrorCode);
     }
 
     [Fact]
